@@ -18,6 +18,7 @@ use tokio::net::UnixListener;
 const SD_LISTEN_FDS_START: RawFd = 3;
 
 /// `Sockets` key in the launchd plist. Must match packaging/macos.
+#[allow(dead_code)] // macOS-only socket activation
 pub const LAUNCHD_SOCKET_NAME: &str = "Listener";
 
 /// 0666 on macOS is deliberate, not sloppy: group `wheel` holds only root and
@@ -44,9 +45,11 @@ pub enum ListenerError {
     #[error("{0} exists and is not a socket; refusing to unlink it")]
     PathOccupied(PathBuf),
 
+    #[allow(dead_code)] // macOS-only socket activation
     #[error("launch_activate_socket({name}) returned {status}")]
     LaunchActivate { name: String, status: i32 },
 
+    #[allow(dead_code)] // macOS-only socket activation
     #[error("expected exactly one activated socket, got {0}")]
     SocketCount(usize),
 }
@@ -54,6 +57,7 @@ pub enum ListenerError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SocketSource {
     Systemd,
+    #[allow(dead_code)] // macOS-only socket activation
     Launchd,
     /// Fallback path: we created the socket ourselves and chmod'ed it after
     /// `bind()`. The window between the two is why activation is preferred.

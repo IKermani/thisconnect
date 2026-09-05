@@ -51,9 +51,11 @@ pub enum AuthError {
         source: std::io::Error,
     },
 
+    #[allow(dead_code)] // macOS-only peer authentication
     #[error("peer audit token was {0} bytes, expected 32")]
     TokenSize(usize),
 
+    #[allow(dead_code)] // macOS-only peer authentication
     #[error(
         "peer code-signature verification is not implemented in this build; \
          denying. See SPEC.md 7.3"
