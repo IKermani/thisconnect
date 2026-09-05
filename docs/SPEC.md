@@ -480,10 +480,11 @@ enough — `remote` and `dev` can still carry traversal or metacharacter payload
 `client`, `pull`, `remote` (RFC1123 host or IP + port 1..65535 + udp/tcp), `proto`, `port`/`lport`/
 `rport`, `dev tun|utun[0-9]*`, `dev-type tun`, `topology`, `resolv-retry`, `nobind`, `float`,
 `remote-random`, `explicit-exit-notify`, `persist-key`, `persist-tun`, `remote-cert-tls server`,
-`remote-cert-eku`, `remote-cert-ku`, `ns-cert-type`, `verify-x509-name`, `data-ciphers`,
-`data-ciphers-fallback`, `auth`, `tls-client`, `tls-version-min`, `tls-cipher`, `tls-ciphersuites`,
-`reneg-sec`, `keepalive`/`ping`/`ping-restart` (bounded), `mssfix`/`tun-mtu`/`tun-mtu-extra`/
-`fragment` (bounded), `sndbuf`/`rcvbuf`, `route-method`, `verb` (clamped 0..4), `mute`,
+`remote-cert-eku`, `remote-cert-ku`, `ns-cert-type`, `verify-x509-name`, `cipher`, `data-ciphers`,
+`data-ciphers-fallback`, `auth`, `tls-client`, `tls-version-min`, `tls-version-max`, `tls-cipher`,
+`tls-ciphersuites`, `reneg-sec`, `keepalive`/`ping`/`ping-restart` (bounded),
+`mssfix`/`tun-mtu`/`tun-mtu-extra`/`fragment` (bounded), `sndbuf`/`rcvbuf`, `route-method`,
+`mute-replay-warnings`, `verb` (clamped 0..4), `mute`,
 `connect-retry`/`connect-retry-max`/`connect-timeout`, `auth-user-pass` (bare only),
 `static-challenge`, `auth-nocache`, `key-direction` (scalar `0|1`), `peer-fingerprint`
 (colon-hex on the line), `<connection>` blocks, and `http-proxy`/`socks-proxy`.
@@ -494,6 +495,13 @@ there is no pushed `--ifconfig`, so no tunnel comes up at all.
 
 `key-direction` and `peer-fingerprint` are **scalar directives, not inline blocks** — classifying
 them as inline-only rejects every `tls-auth` profile **[V]**.
+
+`cipher` is ignored in TLS mode from OpenVPN 2.6 on **[V]**, so validating it against an AEAD list
+would be decorative. It is nonetheless allowlisted and emitted, because it appears in the
+overwhelming majority of profiles written before 2.6 and rejecting it would reject most real-world
+imports. A charset-validated cipher name is not an attack surface, and emitting it keeps
+negotiation fallback working against older servers. An allowlist is only safe if it is also
+usable — a validator that refuses every real profile gets disabled by its users.
 
 `route`, `redirect-gateway`, and `dhcp-option` are **parsed and retained** for proxy-egress logic
 but **never written to the canonical config**. Forwarding them buys nothing and `dhcp-option DNS`

@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# systemd creates the control socket before the daemon starts, which removes the
+# bind() -> chmod() TOCTOU window and stale-socket cleanup entirely. The daemon
+# adopts fd 3 (SPEC.md 7.1).
+
+[Unit]
+Description=thisconnect VPN daemon control socket
+Documentation=https://github.com/thisconnect/thisconnect
+
+[Socket]
+ListenStream=/run/thisconnect/thisconnectd.sock
+# Membership of the thisconnect group is the authorisation model in v1: no
+# polkit. The daemon still authenticates every peer with SO_PEERCRED.
+SocketUser=root
+SocketGroup=thisconnect
+SocketMode=0660
+RemoveOnStop=yes
+# One socket only; the daemon refuses to adopt anything else.
+Accept=no
+
+[Install]
+WantedBy=sockets.target

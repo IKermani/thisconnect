@@ -1,0 +1,130 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  lint-and-test:
+    name: clippy + test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+      # set_freebind_* would let bind() succeed after the tun IP vanishes, destroying
+      # fail-closed egress (docs/SPEC.md 5.3). It cannot go in clippy.toml: the symbol only
+      # exists under cfg(linux), so naming it makes clippy warn on macOS and -D warnings then
+      # fails the build.
+      - name: no fail-closed escape hatches
+        shell: bash
+        run: |
+          set -euo pipefail
+          if grep -rn 'set_freebind' --include='*.rs' .; then
+            echo "::error::set_freebind destroys fail-closed egress (docs/SPEC.md 5.3)"
+            exit 1
+          fi
+
+  no-dev-insecure-ipc:
+    name: release build has dev-insecure-ipc off
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      # A guard that silently stops guarding is worse than no guard: if the feature is ever
+      # renamed or removed, this job must fail loudly rather than keep reporting success.
+      - name: Feature is still declared
+        run: grep -qE '^dev-insecure-ipc[[:space:]]*=' daemon/Cargo.toml
+
+      - name: Feature is not on by default and no member turns it on
+        run: |
+          set -euo pipefail
+          cargo metadata --format-version 1 --no-deps > metadata.json
+          if jq -e '
+            .packages[]
+            | select(.name == "thisconnect-daemon")
+            | (.features.default // [])
+            | index("dev-insecure-ipc")
+          ' metadata.json > /dev/null; then
+            echo "::error::dev-insecure-ipc is in the daemon's default feature set (docs/SPEC.md 7.3)"
+            exit 1
+          fi
+          if jq -e '
+            .packages[].dependencies[]
+            | select(.name == "thisconnect-daemon")
+            | (.features // [])
+            | index("dev-insecure-ipc")
+          ' metadata.json > /dev/null; then
+            echo "::error::a workspace member enables dev-insecure-ipc on the daemon (docs/SPEC.md 7.3)"
+            exit 1
+          fi
+
+      # The metadata check reasons about the manifests; this one reads what rustc was actually
+      # asked to compile in a release profile.
+      - name: Release compile does not set the cfg
+        run: |
+          set -euo pipefail
+          cargo clean
+          cargo build --release --workspace --verbose 2>&1 | tee build.log
+          test -x target/release/thisconnectd
+          if grep -qF 'feature="dev-insecure-ipc"' build.log; then
+            echo "::error::release build compiled the daemon with dev-insecure-ipc enabled"
+            exit 1
+          fi
+
+  scripts:
+    name: verification scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: shellcheck scripts/verify-ifscope-macos.sh scripts/verify-egress-linux.sh
+      # Pure-function suites only. Neither touches the network stack without --confirm.
+      - name: self-tests
+        run: |
+          set -euo pipefail
+          bash scripts/verify-ifscope-macos.sh --self-test
+          bash scripts/verify-egress-linux.sh --self-test
+
+  scripts-macos:
+    name: verification scripts (system bash 3.2)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The macOS script runs under `sudo`, i.e. /bin/bash 3.2, which has no negative array
+      # indices and no ${var@Q}. The ubuntu job above runs bash 5 and would not catch a
+      # 4.x-only construct creeping in.
+      - name: self-tests under /bin/bash
+        run: /bin/bash scripts/verify-ifscope-macos.sh --self-test
+      # Synthetic mode depends on two embedded C helpers. Creating a utun needs root, which this
+      # job does not have, but a source that stops compiling must fail loudly here.
+      - name: embedded C helpers still compile
+        run: /bin/bash scripts/verify-ifscope-macos.sh --compile-check

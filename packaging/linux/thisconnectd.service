@@ -1,0 +1,77 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Non-systemd distributions get none of this hardening. Say so in their docs
+# rather than pretending the daemon is equally confined there.
+
+[Unit]
+Description=thisconnect VPN daemon
+Documentation=https://github.com/thisconnect/thisconnect
+Requires=thisconnectd.socket
+After=network.target thisconnectd.socket
+
+[Service]
+Type=exec
+ExecStart=/usr/libexec/thisconnect/thisconnectd
+Sockets=thisconnectd.socket
+Restart=on-failure
+RestartSec=2s
+
+# Privilege: exactly CAP_NET_ADMIN, and nothing may ever be regained beyond it.
+# Not CAP_NET_RAW, not CAP_SETUID, not CAP_DAC_OVERRIDE (SPEC.md 7.1).
+User=thisconnectd
+Group=thisconnectd
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+
+# The canonical sanitised .ovpn lives here, mode 0600 in a 0700 directory.
+StateDirectory=thisconnect
+StateDirectoryMode=0700
+UMask=0077
+
+# /run/thisconnect is created by tmpfiles.d, not RuntimeDirectory=, because the
+# socket unit owns the socket inside it and RuntimeDirectory= would chown and
+# delete the directory out from under it.
+
+# ProtectSystem=strict mounts the whole hierarchy read-only, /run included, so
+# /run/thisconnect has to be punched back out: the daemon creates the openvpn
+# management socket there. Socket activation is unaffected — systemd creates the
+# control socket outside this namespace and passes it as fd 3.
+ProtectSystem=strict
+ReadWritePaths=/run/thisconnect
+ProtectHome=yes
+PrivateTmp=yes
+PrivateMounts=yes
+ProtectProc=invisible
+ProtectClock=yes
+ProtectHostname=yes
+ProtectControlGroups=yes
+ProtectKernelTunables=yes
+ProtectKernelLogs=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+RemoveIPC=yes
+KeyringMode=private
+
+# The tun device is the whole point; nothing else is.
+DevicePolicy=closed
+DeviceAllow=/dev/net/tun rw
+
+# AF_NETLINK for rtnetlink route/rule work, AF_UNIX for IPC and the openvpn
+# management socket, AF_INET/AF_INET6 for the spawned openvpn's own traffic —
+# this applies to the whole unit, children included.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
+# Deliberately NOT set:
+#   ProtectKernelModules=yes  — blocks autoloading the tun module on hosts where
+#                               it is not already loaded; ship modules-load.d
+#                               first if this is ever turned on.
+#   MemoryDenyWriteExecute=yes — the spawned openvpn dlopen()s OpenSSL providers.
+#   SystemCallFilter=~@privileged — CAP_NET_ADMIN work is exactly @privileged.
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

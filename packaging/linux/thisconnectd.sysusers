@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Install as /usr/lib/sysusers.d/thisconnectd.conf
+u thisconnectd - "thisconnect VPN daemon" /var/lib/thisconnect
+g thisconnect -

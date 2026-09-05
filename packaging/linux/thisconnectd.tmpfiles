@@ -1,0 +1,6 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Install as /usr/lib/tmpfiles.d/thisconnectd.conf
+#
+# 0750 thisconnectd:thisconnect — the daemon writes the openvpn management
+# socket here, and members of thisconnect need +x to reach the control socket.
+d /run/thisconnect 0750 thisconnectd thisconnect -
