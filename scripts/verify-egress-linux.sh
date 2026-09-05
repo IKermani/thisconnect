@@ -7,13 +7,19 @@
 #   a) with the full policy installed, a socket bound to the tun IP reaches table 218;
 #   b) deleting the tunnel route while the tun IP is STILL PRESENT yields EHOSTUNREACH from
 #      the `unreachable` floor route — the only assertion that actually exercises the floor;
-#   c) deleting the `ip rule` does NOT fall through to table main.
+#   c) deleting the `ip rule` does NOT fall through to table main, because a lower-priority
+#      backstop rule catches the same source address.
 #
 # Test 2 (--egress-check, needs a live tunnel): an IP-echo request bound to the tun source
 #   address must report the exit node's address, not the ISP's.
 #
 # `blackhole` is deliberately NOT used: RTN_BLACKHOLE yields EINVAL, which maps to no SOCKS5
 # reply code. RTN_UNREACHABLE yields EHOSTUNREACH, which maps to REP 0x04.
+#
+# The floor and the backstop are not redundant. The floor lives inside table 218 and so is
+# unreachable once the rule is gone; only the backstop covers rule deletion. They answer with
+# different errnos because they act at different layers: FR_ACT_UNREACHABLE on a rule yields
+# ENETUNREACH (REP 0x03), RTN_UNREACHABLE on a route yields EHOSTUNREACH (REP 0x04).
 
 set -euo pipefail
 
@@ -30,6 +36,7 @@ TUN_PREFIX="24"
 TUN_MTU="1400"
 TABLE="218"
 RULE_PRIORITY="18000"
+BACKSTOP_PRIORITY="18500"
 FLOOR_METRIC="4000"
 ROUTE_METRIC="100"
 DST_IP="1.1.1.1"
@@ -192,7 +199,13 @@ evaluate_rule_verdict() {
     echo "FAIL removing the rule still produced a working connection"
     return 0
   fi
-  echo "PASS no fall-through to main (selected dev='${dev:-none}', probe=$(errno_label "$rc"))"
+  # The backstop must produce a mappable errno, not merely an absence of connectivity. A hang is
+  # not fail-closed: the SOCKS5 layer has nothing to reply with and the caller waits on tcp_retries2.
+  if [ "$rc" != "$RC_ENETUNREACH" ] && [ "$rc" != "$RC_EHOSTUNREACH" ]; then
+    echo "FAIL removing the rule neither fell through nor refused: probe=$(errno_label "$rc"); the backstop rule did not fire"
+    return 0
+  fi
+  echo "PASS backstop refused it (selected dev='${dev:-none}', probe=$(errno_label "$rc"))"
 }
 
 # evaluate_egress_verdict <direct_ip> <tunnel_ip> -> "PASS ..." | "FAIL ..."
@@ -371,7 +384,9 @@ run_probe() {
 }
 
 install_policy() {
-  step "Installing the §5.2 policy (floor first, then rule, then the real route)"
+  step "Installing the §5.2 policy (backstop, floor, rule, then the real route)"
+  mutate ip rule add from "$TUN_IP/32" type unreachable priority "$BACKSTOP_PRIORITY"
+  UNDO_COMMANDS+=("ip rule del priority $BACKSTOP_PRIORITY")
   mutate ip route add unreachable default table "$TABLE" metric "$FLOOR_METRIC"
   UNDO_COMMANDS+=("ip route del unreachable default table $TABLE metric $FLOOR_METRIC")
   mutate ip rule add from "$TUN_IP/32" lookup "$TABLE" priority "$RULE_PRIORITY"
@@ -418,7 +433,7 @@ run_floor_test() {
 }
 
 run_rule_test() {
-  step "Deleting the ip rule: must fail, not fall through to table main"
+  step "Deleting the ip rule: the backstop must refuse it, not fall through to table main"
   local rc=0 selected route_get
   mutate ip rule del priority "$RULE_PRIORITY"
   route_get="$(ip route get "$DST_IP" from "$TUN_IP" 2>&1 || true)"
@@ -446,6 +461,7 @@ print_plan() {
 This run will, as root:
   - create a throwaway tun '$TUN_DEV' and give it $TUN_IP/$TUN_PREFIX
   - add, exercise and then remove:
+      ip rule add from $TUN_IP/32 type unreachable priority $BACKSTOP_PRIORITY
       ip route add unreachable default table $TABLE metric $FLOOR_METRIC
       ip rule add from $TUN_IP/32 lookup $TABLE priority $RULE_PRIORITY
       ip route add default dev $TUN_DEV src $TUN_IP table $TABLE metric $ROUTE_METRIC mtu $TUN_MTU
@@ -453,7 +469,8 @@ This run will, as root:
   - delete everything it created, including on failure
 
 It will NOT touch table main, the default route, resolv.conf, or any existing interface,
-rule or tun device. If '$TUN_DEV' or priority $RULE_PRIORITY already exists, it aborts.
+rule or tun device. If '$TUN_DEV', priority $RULE_PRIORITY or priority $BACKSTOP_PRIORITY already
+exists, it aborts.
 Re-run with --confirm to execute.
 EOF
 }
@@ -464,6 +481,9 @@ preflight() {
   command -v ip >/dev/null || die "iproute2 is required"
   if ip rule show | grep -qE "^${RULE_PRIORITY}:"; then
     die "an ip rule already exists at priority $RULE_PRIORITY; refusing to disturb it"
+  fi
+  if ip rule show | grep -qE "^${BACKSTOP_PRIORITY}:"; then
+    die "an ip rule already exists at priority $BACKSTOP_PRIORITY; refusing to disturb it"
   fi
   [ -z "$LIVE_TUN_IP" ] || [ -n "$ECHO_URL" ] || die "--egress-check also needs --echo-url"
 }
@@ -588,9 +608,14 @@ test_rule_fails_when_connection_still_succeeds() {
     "$(evaluate_rule_verdict "tc-verify0" "$RC_CONNECTED" "")"
 }
 
-test_rule_passes_when_no_route_is_selected() {
-  check_prefix "rule_passes_when_no_route_is_selected" "PASS" \
+test_rule_passes_when_the_backstop_refuses() {
+  check_prefix "rule_passes_when_the_backstop_refuses" "PASS" \
     "$(evaluate_rule_verdict "tc-verify0" "$RC_ENETUNREACH" "")"
+}
+
+test_rule_fails_when_it_only_hangs() {
+  check_prefix "rule_fails_when_it_only_hangs" "FAIL removing the rule neither" \
+    "$(evaluate_rule_verdict "tc-verify0" "$RC_PENDING" "")"
 }
 
 test_egress_fails_when_addresses_match() {
@@ -621,7 +646,8 @@ run_self_test() {
   test_floor_passes_on_ehostunreach
   test_rule_fails_on_fall_through_to_physical_device
   test_rule_fails_when_connection_still_succeeds
-  test_rule_passes_when_no_route_is_selected
+  test_rule_passes_when_the_backstop_refuses
+  test_rule_fails_when_it_only_hangs
   test_egress_fails_when_addresses_match
   test_egress_fails_when_tunnel_request_returned_nothing
   test_egress_passes_when_exit_address_differs

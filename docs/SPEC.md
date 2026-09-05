@@ -259,11 +259,13 @@ socket into that scope.
 **Linux** — policy routing keyed on source address:
 
 ```sh
-# 1. fail-closed floor FIRST, and it outlives individual connections
+# 1. backstop FIRST: the only layer that survives deletion of the rule in step 3
+ip rule add from <tunip>/32 type unreachable priority 18500
+# 2. fail-closed floor, which outlives individual connections
 ip route add unreachable default table 218 metric 4000
-# 2. rule
+# 3. rule
 ip rule add from <tunip>/32 lookup 218 priority 18000
-# 3. real route
+# 4. real route
 ip route add default dev <tun> src <tunip> table 218 metric 100 mtu <tunmtu>
 ```
 
@@ -272,7 +274,19 @@ Mirrored for IPv6 when the tun has a v6 address; otherwise the proxy refuses `AF
 - **`unreachable`, not `blackhole`.** `fib_props[]` in `net/ipv4/fib_semantics.c`: `RTN_BLACKHOLE`
   → `-EINVAL`, `RTN_UNREACHABLE` → `-EHOSTUNREACH` **[V]**. `EINVAL` from `connect()` is
   indistinguishable from a caller bug and maps to no SOCKS5 reply code; `EHOSTUNREACH` maps
-  cleanly to REP `0x04`.
+  cleanly to REP `0x04`. Observed on Ubuntu 24.04 / iproute2 6.1.0: with the tun address still
+  present, deleting the tunnel route yields `EHOSTUNREACH(113)`, and a matched `unreachable`
+  route *terminates* the lookup rather than falling through to the next rule **[V]**.
+
+- **The backstop rule is not redundant with the floor.** The floor lives inside table 218 and is
+  therefore unreachable the moment the policy rule is gone. Deleting that rule was observed to fall
+  straight through to table `main` and out of the physical interface — a silent leak **[V]**. No
+  content of table 218 can prevent this, because route lookup is destination-keyed and table 218 is
+  not consulted at all once the rule is gone. Hence a second rule, at a lower priority, matching the
+  same source address. Note the errno differs by layer: `FR_ACT_UNREACHABLE` on a *rule* yields
+  `ENETUNREACH` → REP `0x03`, where `RTN_UNREACHABLE` on a *route* yields `EHOSTUNREACH` → REP
+  `0x04`. Both are already mapped by the egress dialer **[V]**. Deleting *both* rules still leaks,
+  which is why the netlink watcher below remains required rather than optional.
 - **No `rp_filter` sysctl.** Source-address binding provably survives strict reverse-path
   filtering: `__fib_validate_source()` sets `fl4.daddr = src; fl4.saddr = dst`, so the RPF reverse
   lookup carries the tun IP as source, re-fires the `from <tunip>` rule, and lands in table 218
@@ -281,8 +295,11 @@ Mirrored for IPv6 when the tun has a v6 address; otherwise the proxy refuses `AF
 - **Netlink watcher.** Watch `RTM_NEWRULE`, `RTM_DELRULE`, `RTM_DELROUTE`, `RTM_DELADDR` and
   re-assert. NetworkManager, systemd-networkd, and other VPN clients rewrite policy routing;
   Tailscale issue #2325 documents rules being discarded on connectivity changes.
-- **Teardown order:** stop listener → kill live sessions → remove rule → remove table. The floor
-  route is removed last, and only after the rule is confirmed gone.
+- **Teardown order:** stop listener → kill live sessions → remove tunnel route → remove rule →
+  remove floor → remove backstop. The backstop is removed last, and only after the rule is confirmed
+  gone; it is the outermost layer, so it is installed first and torn down last. Every intermediate
+  state fails closed. `Plan` encodes this as an ordering invariant over `StepKind`, and teardown
+  walks it in reverse, so a backend cannot regress the order silently.
 
 **macOS** — interface-scoped routing:
 
@@ -755,10 +772,22 @@ claim, not a guarantee.
 
    Not covered: IPC peer authentication. The harness must build with `dev-insecure-ipc` because no
    shell script can present the GUI's code signature; §7.3 is covered by its own tests.
-3. **Fail-closed floor (Linux).** **[U]** With the tun IP **still present**, delete the tunnel route
-   from table 218 and assert `connect()` returns `EHOSTUNREACH` from the floor route. This is the
-   only test that exercises the floor. Separately, delete the `ip rule` and assert failure rather
-   than fall-through to `main`. `scripts/verify-egress-linux.sh` is written and has never run.
+3. **Fail-closed floor and backstop (Linux).** **[V]** With the tun IP **still present**, delete the
+   tunnel route from table 218 and assert `connect()` returns `EHOSTUNREACH` from the floor route.
+   This is the only test that exercises the floor. Separately, delete the `ip rule` and assert
+   failure rather than fall-through to `main`. Run under `sudo` on Ubuntu 24.04 / iproute2 6.1.0 by
+   `scripts/verify-egress-linux.sh`:
+
+   | Case | Result |
+   |---|---|
+   | Full policy installed, socket bound to the tun IP | `PENDING` — route lookup cleared, nothing answers |
+   | Tunnel route deleted, tun address still present | `EHOSTUNREACH(113)` — the floor, not a missing address |
+   | Policy rule deleted, **no backstop** | fell through to `main` via the physical link — **leak** |
+   | Policy rule deleted, backstop installed | `ENETUNREACH(101)` — fails closed |
+   | Default route, during and after | byte-for-byte unchanged, no residue |
+
+   The third row is why the backstop exists; it was a real finding, not a hypothetical. The
+   remaining gap is a Debian stable and Fedora run.
 
 A tun-flap test is worth keeping but must be labelled honestly: it tests `bind()` returning
 `EADDRNOTAVAIL`, **not** the routing policy. It passes with no rule and no floor installed, which is
@@ -812,12 +841,12 @@ for.** Publish reproducible builds and checksums early so "verify it yourself" i
 
 1. **Nothing on macOS.** §10 tests 1 and 2 both passed against a real server; the macOS half of the
    design is verified rather than argued.
-2. **Everything on Linux.** Not one command in §5.2's Linux half has ever executed: the policy
-   module is transcribed from the spec and covered only by argument-vector tests, and
-   `scripts/verify-egress-linux.sh` has never run. The `ip rule del lookup 218` selector form, the
-   `mtu` argument on `ip route add`, and the exact `ip rule show` substring the verification
-   matches on all need confirming on Debian stable and Fedora. This is now the largest unverified
-   surface in the project.
+2. **Linux, partially closed.** §5.2's routing half now runs: `scripts/verify-egress-linux.sh`
+   passed under `sudo` on Ubuntu 24.04 / iproute2 6.1.0, and the `ip rule del lookup 218` selector
+   form, the `mtu` argument on `ip route add`, and the exact `ip rule show` substring the
+   verification matches on (`from <ip> lookup 218`, rendered without the `/32`) were all confirmed
+   directly. Still open: a Debian stable and Fedora run, and a live-tunnel run against a real
+   server — `scripts/verify-live-tunnel.sh` is still macOS-only.
 3. Linux distro matrix for §5.2 — every routing, teardown, and RPF claim needs verification on at
    least Debian stable and Fedora. No Linux machine was available during research.
 4. Whether to ship full-tunnel mode in v1.0 after all. It is what most users expect, and the daemon

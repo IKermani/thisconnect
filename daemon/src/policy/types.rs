@@ -17,6 +17,11 @@ use super::PolicyError;
 /// possible without any ownership marking the kernel does not offer.
 pub const POLICY_TABLE: &str = "218";
 pub const RULE_PRIORITY: &str = "18000";
+/// The backstop must lose to the real rule and catch everything the real rule would have taken.
+/// Deleting the real rule is otherwise a silent fall-through to table `main` — observed on
+/// iproute2 6.1.0, because route lookup is destination-keyed and table 218 is not consulted at
+/// all once the rule is gone. No content of table 218 can substitute for this.
+pub const BACKSTOP_PRIORITY: &str = "18500";
 /// The floor must lose to the real tunnel route and win against nothing else.
 pub const FLOOR_METRIC: &str = "4000";
 pub const ROUTE_METRIC: &str = "100";
