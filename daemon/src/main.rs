@@ -33,10 +33,12 @@ use peerauth::lookup_group_id;
 use peerauth::AUTHORISED_GROUP;
 use peerauth::{authenticator, PeerPolicy};
 use policy::{PolicyManager, SystemRunner};
-use session::proxy::{ProxyPublisher, ProxySettings, ProxyStatus, UnavailableRuntime};
+use session::proxy::runtime::LinkedRuntime;
+use session::proxy::{ProxyPublisher, ProxySettings, ProxyStatus};
 use session::store::ProfileStore;
 use session::tunnel::{ManagedPolicy, TunnelPolicyDriver};
 use session::{system_deps, SessionConfig, SessionManager};
+use thisconnect_proxy::egress::DestinationPolicy;
 
 #[cfg(target_os = "macos")]
 const DEFAULT_SOCKET_PATH: &str = "/var/run/thisconnect.sock";
@@ -233,16 +235,18 @@ async fn reconcile_startup_state(session: &SessionManager) {
 }
 
 /// The proxy listener, attached to the tunnel lifecycle.
+/// The proxy worker the tunnel publishes to.
 ///
-/// The listener itself lives in the unprivileged `thisconnect-proxy` crate, which
-/// this binary does not link: `UnavailableRuntime` is what stands in for it, and
-/// it refuses to publish rather than letting a tunnel come up that nothing can
-/// egress through (SPEC.md §3.1 point 5). Replacing it with the real adapter is
-/// the only change this function needs.
+/// `LinkedRuntime` builds the pinned egress, the tunnel-pinned resolver and the
+/// dialer that joins them, then starts the listener. A failure anywhere in that
+/// chain is a refusal, so a tunnel never comes up with nothing able to egress
+/// through it (SPEC.md §3.1 point 5).
 fn proxy_publisher(config: &SessionConfig) -> Arc<ProxyPublisher> {
-    warn!("no proxy worker is linked into this build; connecting will fail once the tunnel is up, rather than coming up with no way to use it");
     Arc::new(ProxyPublisher::new(
-        Arc::new(UnavailableRuntime),
+        Arc::new(LinkedRuntime::new(
+            tokio::runtime::Handle::current(),
+            DestinationPolicy::default(),
+        )),
         ProxySettings::from_config(config),
     ))
 }

@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 thisconnect-shared = { path = "../shared" }
+thisconnect-proxy = { path = "../proxy" }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 serde = { workspace = true }

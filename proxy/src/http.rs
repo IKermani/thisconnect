@@ -39,6 +39,12 @@ const MAX_HOST_LEN: usize = 255;
 
 pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The upstream connect gets its own bound. Left to the OS, a SYN to a
+/// black-holed destination is retried for roughly a quarter of an hour, and for
+/// all of it the task, the client socket and the tunnel-pinned source port stay
+/// held by a client that only had to name an unreachable host.
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
 const CHALLENGE: &str = "Proxy-Authenticate: Basic realm=\"thisconnect\", charset=\"UTF-8\"";
 
 // ---------------------------------------------------------------------------
@@ -57,6 +63,7 @@ const ST_HEAD_TOO_LARGE: Status = (431, "Request Header Fields Too Large");
 const ST_NOT_IMPLEMENTED: Status = (501, "Not Implemented");
 const ST_BAD_GATEWAY: Status = (502, "Bad Gateway");
 const ST_UNAVAILABLE: Status = (503, "Service Unavailable");
+const ST_GATEWAY_TIMEOUT: Status = (504, "Gateway Timeout");
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -70,6 +77,9 @@ pub struct HttpConfig {
     /// From `PUSH_REPLY`; gates IPv6 literal destinations (SPEC.md §5.5).
     pub tunnel_has_v6: bool,
     pub handshake_timeout: Duration,
+    /// Bounds the upstream connect, which the handshake timeout does not cover:
+    /// negotiation is finished by the time we dial.
+    pub connect_timeout: Duration,
 }
 
 impl HttpConfig {
@@ -78,6 +88,7 @@ impl HttpConfig {
             auth,
             tunnel_has_v6,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
         }
     }
 }
@@ -112,6 +123,8 @@ pub enum HttpError {
     AuthRateLimited,
     #[error("tunnel has no IPv6 address; refusing an IPv6 destination")]
     Ipv6Unsupported,
+    #[error("upstream connection timed out")]
+    DialTimeout,
     #[error(transparent)]
     Dial(#[from] DialError),
 }
@@ -134,6 +147,7 @@ impl HttpError {
                 Some(ST_PROXY_AUTH_REQUIRED)
             }
             HttpError::Ipv6Unsupported => Some(ST_FORBIDDEN),
+            HttpError::DialTimeout => Some(ST_GATEWAY_TIMEOUT),
             HttpError::Dial(err) => Some(dial_status(*err)),
         }
     }
@@ -197,24 +211,44 @@ where
         }
     };
 
-    match dialer.tcp(&head.target).await {
-        Ok(upstream) => {
-            // No headers on a 2xx to CONNECT: RFC 9110 forbids content framing
-            // here, and every header we could add is an attribution leak.
-            client
-                .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
-                .await?;
-            client.flush().await?;
-            Ok(Established {
-                target: head.target,
-                upstream,
-                pending: head.pending,
-            })
-        }
+    let upstream = match dial_upstream(dialer, &head.target, config.connect_timeout).await {
+        Ok(upstream) => upstream,
         Err(err) => {
-            respond(client, dial_status(err), false).await?;
-            Err(HttpError::Dial(err))
+            if let Some(status) = err.status() {
+                respond(client, status, false).await?;
+            }
+            return Err(err);
         }
+    };
+
+    // No headers on a 2xx to CONNECT: RFC 9110 forbids content framing here,
+    // and every header we could add is an attribution leak.
+    client
+        .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+        .await?;
+    client.flush().await?;
+    Ok(Established {
+        target: head.target,
+        upstream,
+        pending: head.pending,
+    })
+}
+
+/// The dial needs its own deadline. [`HttpConfig::handshake_timeout`] has
+/// already been satisfied by the time we get here, so without this a CONNECT to
+/// an address that silently drops SYNs holds the task for as long as the OS
+/// retries — minutes, not seconds.
+async fn dial_upstream<D>(
+    dialer: &D,
+    target: &Target,
+    limit: Duration,
+) -> Result<D::Stream, HttpError>
+where
+    D: Dialer,
+{
+    match tokio::time::timeout(limit, dialer.tcp(target)).await {
+        Ok(result) => result.map_err(HttpError::Dial),
+        Err(_elapsed) => Err(HttpError::DialTimeout),
     }
 }
 
@@ -686,15 +720,31 @@ mod tests {
 
     struct StubDialer {
         result: Result<(), DialError>,
+        /// Never resolves, which is what a destination that swallows SYNs looks
+        /// like to the dialer.
+        black_holed: bool,
     }
 
     impl StubDialer {
         fn ok() -> Self {
-            Self { result: Ok(()) }
+            Self {
+                result: Ok(()),
+                black_holed: false,
+            }
         }
 
         fn failing(err: DialError) -> Self {
-            Self { result: Err(err) }
+            Self {
+                result: Err(err),
+                black_holed: false,
+            }
+        }
+
+        fn black_holed() -> Self {
+            Self {
+                result: Ok(()),
+                black_holed: true,
+            }
         }
     }
 
@@ -702,6 +752,9 @@ mod tests {
         type Stream = DuplexStream;
 
         async fn tcp(&self, _target: &Target) -> Result<Self::Stream, DialError> {
+            if self.black_holed {
+                std::future::pending::<()>().await;
+            }
             self.result.map(|_| duplex(8).0)
         }
     }
@@ -992,6 +1045,41 @@ mod tests {
 
         assert!(matches!(result, Err(HttpError::HandshakeTimeout)));
         assert!(written(client).starts_with("HTTP/1.1 408 Request Timeout\r\n"));
+    }
+
+    /// The negotiation is complete here, so the handshake timeout is spent. A
+    /// dial that never completes must not be able to hold the task open.
+    #[tokio::test]
+    async fn a_black_holed_destination_cannot_pin_the_task_past_the_connect_timeout() {
+        // Arrange
+        let config = HttpConfig {
+            connect_timeout: Duration::from_millis(20),
+            // Long enough that a timeout can only have come from the dial.
+            handshake_timeout: Duration::from_secs(60),
+            ..open_config()
+        };
+
+        // Act
+        let (result, out) = run(
+            vec![connect_request("example.com:443")],
+            &config,
+            &StubDialer::black_holed(),
+        )
+        .await;
+
+        // Assert
+        assert!(matches!(result, Err(HttpError::DialTimeout)));
+        assert!(out.starts_with("HTTP/1.1 504 Gateway Timeout\r\n"));
+    }
+
+    #[test]
+    fn the_connect_timeout_is_bounded_by_default() {
+        // Arrange / Act
+        let config = open_config();
+
+        // Assert — an unset bound is the whole defect; the OS one is ~15 minutes.
+        assert_eq!(config.connect_timeout, DEFAULT_CONNECT_TIMEOUT);
+        assert!(config.connect_timeout <= Duration::from_secs(60));
     }
 
     #[tokio::test]

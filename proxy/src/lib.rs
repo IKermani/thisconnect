@@ -14,6 +14,7 @@
 //! Pass a `SocketAddr` obtained from the tunnel-pinned resolver instead.
 
 pub mod credentials;
+pub mod dialer;
 pub mod egress;
 pub mod http;
 pub mod listener;

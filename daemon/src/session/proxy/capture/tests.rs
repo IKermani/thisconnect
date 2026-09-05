@@ -9,6 +9,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::*;
+use crate::session::dns::MissingDns;
 
 const PUSH_LINE: &str = ">LOG:1741000000,I,PUSH: Received control message: 'PUSH_REPLY,dhcp-option DNS 10.8.0.1,dhcp-option DOMAIN corp.example,ifconfig 10.8.0.2 255.255.255.0'";
 
@@ -49,6 +50,70 @@ fn ignores_a_log_line_that_is_not_a_push_reply() {
     cell.observe_line(">LOG:1741000000,I,OPTIONS IMPORT: --ifconfig/up options modified");
 
     assert!(cell.current().captured().is_none());
+}
+
+/// The message body is server-controlled. If merely containing `PUSH_REPLY`
+/// were enough, a peer could hide a resolver of its choosing inside any other
+/// control message and have it adopted for the whole session.
+#[test]
+fn a_control_message_that_only_mentions_push_reply_cannot_set_the_resolver() {
+    // Arrange
+    let cell = DnsCaptureCell::new();
+
+    // Act
+    cell.observe_line(
+        ">LOG:1741000000,I,PUSH: Received control message: 'AUTH_FAILED,see PUSH_REPLY,dhcp-option DNS 198.51.100.9'",
+    );
+
+    // Assert — untouched, not merely parsed to nothing.
+    assert_eq!(cell.current(), DnsCapture::none_received());
+}
+
+#[test]
+fn a_kind_that_merely_starts_with_push_reply_is_not_a_push_reply() {
+    // Arrange
+    let cell = DnsCaptureCell::new();
+
+    // Act
+    cell.observe_line(
+        ">LOG:1741000000,I,PUSH: Received control message: 'PUSH_REPLY_V2,dhcp-option DNS 198.51.100.9'",
+    );
+
+    // Assert
+    assert_eq!(cell.current(), DnsCapture::none_received());
+}
+
+/// The substring appears before the marker rather than after it, which the
+/// parser reaches by searching from the marker onwards.
+#[test]
+fn push_reply_in_the_log_prefix_is_not_a_control_message() {
+    // Arrange
+    let cell = DnsCaptureCell::new();
+
+    // Act
+    cell.observe_line(
+        ">LOG:1741000000,I,PUSH_REPLY: Received control message: 'INFO,dhcp-option DNS 198.51.100.9'",
+    );
+
+    // Assert
+    assert_eq!(cell.current(), DnsCapture::none_received());
+}
+
+/// A real push carrying no options at all is still a push, and the anchoring
+/// must not turn it into "no push was ever sent".
+#[test]
+fn an_option_less_push_reply_is_still_recognised() {
+    // Arrange
+    let cell = DnsCaptureCell::new();
+
+    // Act
+    cell.observe_line(">LOG:1741000009,I,PUSH: Received control message: 'PUSH_REPLY'");
+
+    // Assert
+    assert_eq!(
+        cell.current(),
+        DnsCapture::Missing(MissingDns::NoDnsOptions)
+    );
 }
 
 #[test]

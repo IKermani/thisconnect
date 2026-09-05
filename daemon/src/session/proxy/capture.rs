@@ -33,6 +33,10 @@ use crate::session::SessionError;
 /// being copied, which keeps prompts and auth tokens out of the tap's buffer.
 const LOG_PREFIX: &[u8] = b">LOG:";
 
+/// openvpn logs the push as `PUSH: Received control message: 'PUSH_REPLY,…'`.
+const CONTROL_MESSAGE_MARKER: &str = "Received control message:";
+const PUSH_REPLY_KIND: &str = "PUSH_REPLY";
+
 /// The session's DNS capture, shared between the tap that fills it and the
 /// publisher that reads it.
 #[derive(Debug)]
@@ -69,7 +73,11 @@ impl DnsCaptureCell {
         let Some(payload) = line.strip_prefix(">LOG:") else {
             return;
         };
-        let Some(reply) = PushReply::from_log_text(&LogEvent::parse(payload).text) else {
+        let text = LogEvent::parse(payload).text;
+        if !is_push_reply(&text) {
+            return;
+        }
+        let Some(reply) = PushReply::from_log_text(&text) else {
             return;
         };
         self.absorb(
@@ -238,6 +246,25 @@ impl LineScanner {
         self.line.clear();
         self.skipping = false;
     }
+}
+
+/// The kind is matched where openvpn actually puts it — first thing in the
+/// control message body — and not merely searched for. A message whose *body*
+/// happens to contain `PUSH_REPLY` is a server-controlled string: accepting it
+/// would let a peer smuggle a `dhcp-option DNS` of its choosing through any
+/// other message and take over the session's resolver.
+fn is_push_reply(text: &str) -> bool {
+    let Some((_, message)) = text.split_once(CONTROL_MESSAGE_MARKER) else {
+        return false;
+    };
+    let message = message.trim_start();
+    let body = message.strip_prefix(['\'', '"']).unwrap_or(message);
+    let Some(rest) = body.strip_prefix(PUSH_REPLY_KIND) else {
+        return false;
+    };
+    // A push with no options at all is `'PUSH_REPLY'`; anything else that
+    // continues the token is a different kind whose name merely starts the same.
+    rest.is_empty() || rest.starts_with([',', '\'', '"'])
 }
 
 fn lock<T>(cell: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {

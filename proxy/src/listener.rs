@@ -30,7 +30,7 @@ use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use crate::credentials::{socks5h_url_without_auth, ProxyCredentials};
-use crate::http::HttpConfig;
+use crate::http::{HttpConfig, DEFAULT_CONNECT_TIMEOUT};
 use crate::socks5::{AuthPolicy, AuthRateLimiter, Dialer, Socks5Config, DEFAULT_HANDSHAKE_TIMEOUT};
 use crate::stats::StatsCollector;
 
@@ -78,6 +78,8 @@ pub struct ListenerConfig {
     /// From `PUSH_REPLY`; gates IPv6 destinations (SPEC.md §5.5).
     pub tunnel_has_v6: bool,
     pub handshake_timeout: Duration,
+    /// Bounds the upstream dial, which the handshake timeout does not cover.
+    pub connect_timeout: Duration,
 }
 
 impl ListenerConfig {
@@ -97,6 +99,7 @@ impl ListenerConfig {
             allowed_cidrs: Vec::new(),
             tunnel_has_v6,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
         }
     }
 
@@ -198,8 +201,20 @@ impl Handle {
 
     /// Stops accepting and aborts every live session before returning. Called
     /// on any transition away from `CONNECTED` (SPEC.md §5.6 L6).
-    pub async fn shutdown(mut self) {
+    /// Signals every acceptor and live session to stop, and returns immediately.
+    ///
+    /// Separate from [`Self::shutdown`] because the teardown path is synchronous
+    /// and must not yield: sockets pinned to a tun that is going away hang for
+    /// ~15 minutes if they are merely closed, so the signal has to be delivered
+    /// before teardown continues, not whenever a spawned task next runs.
+    /// Idempotent.
+    pub fn stop(&self) {
         let _ = self.shutdown.send(true);
+    }
+
+    /// Signals, then waits for the acceptors to finish.
+    pub async fn shutdown(mut self) {
+        self.stop();
         for acceptor in std::mem::take(&mut self.acceptors) {
             let _ = acceptor.await;
         }
@@ -241,10 +256,27 @@ pub(crate) async fn bind_tcp(addr: SocketAddr) -> io::Result<TcpListener> {
     TcpListener::bind(addr).await
 }
 
+/// A listener together with the address it is actually on, read once at bind
+/// time. A configured port of 0 only becomes a real port here.
+struct Bound {
+    listener: TcpListener,
+    addr: SocketAddr,
+}
+
 /// What [`bind_all`] managed to bind, and what it had to give up on.
 struct BindOutcome {
-    listeners: Vec<TcpListener>,
+    bound: Vec<Bound>,
     skipped: Vec<SocketAddr>,
+}
+
+/// A socket whose `local_addr()` cannot be read is useless to us even though
+/// the bind succeeded: the GUI would be handed a proxy URL for an address it
+/// cannot know is listening. Treat it as a bind failure rather than dropping it
+/// from the reported set and leaving the caller to guess.
+async fn bind_one(addr: SocketAddr) -> io::Result<Bound> {
+    let listener = bind_tcp(addr).await?;
+    let addr = listener.local_addr()?;
+    Ok(Bound { listener, addr })
 }
 
 /// The shipping default is the loopback pair `127.0.0.1` and `[::1]`
@@ -254,13 +286,13 @@ struct BindOutcome {
 /// A non-loopback failure is a real refusal and still fails the call, and so
 /// does failing to bind anything at all.
 async fn bind_all(addrs: &[SocketAddr]) -> Result<BindOutcome, ListenerError> {
-    let mut listeners = Vec::with_capacity(addrs.len());
+    let mut bound = Vec::with_capacity(addrs.len());
     let mut skipped = Vec::new();
     let mut first_failure = None;
 
     for addr in addrs {
-        match bind_tcp(*addr).await {
-            Ok(listener) => listeners.push(listener),
+        match bind_one(*addr).await {
+            Ok(listener) => bound.push(listener),
             Err(source) if addr.ip().is_loopback() => {
                 warn!(%addr, error = %source, "cannot bind loopback address, skipping it");
                 skipped.push(*addr);
@@ -279,8 +311,8 @@ async fn bind_all(addrs: &[SocketAddr]) -> Result<BindOutcome, ListenerError> {
     }
 
     match first_failure {
-        Some(failure) if listeners.is_empty() => Err(failure),
-        _ => Ok(BindOutcome { listeners, skipped }),
+        Some(failure) if bound.is_empty() => Err(failure),
+        _ => Ok(BindOutcome { bound, skipped }),
     }
 }
 
@@ -296,12 +328,12 @@ where
 {
     config.validate()?;
 
-    let BindOutcome { listeners, skipped } = bind_all(&config.bind_addrs).await?;
+    let BindOutcome { bound, skipped } = bind_all(&config.bind_addrs).await?;
 
-    let listen_addrs = listeners
-        .iter()
-        .filter_map(|listener| listener.local_addr().ok())
-        .collect::<Vec<_>>();
+    // Every bound socket appears here or the start already failed: an address
+    // silently missing from this list is one the GUI would advertise without a
+    // listener behind it.
+    let listen_addrs = bound.iter().map(|entry| entry.addr).collect::<Vec<_>>();
 
     let stats = StatsCollector::new(config.tunnel_has_v6);
     let config = Arc::new(config);
@@ -315,6 +347,7 @@ where
             auth: config.auth.policy(),
             tunnel_has_v6: config.tunnel_has_v6,
             handshake_timeout: config.handshake_timeout,
+            connect_timeout: config.connect_timeout,
         },
         limiter: AuthRateLimiter::new(),
         allowed_cidrs: config.allowed_cidrs.clone(),
@@ -323,12 +356,12 @@ where
     });
 
     let (shutdown, _) = watch::channel(false);
-    let acceptors = listeners
+    let acceptors = bound
         .into_iter()
-        .map(|listener| {
+        .map(|entry| {
             let runtime = Arc::clone(&runtime);
             let signal = shutdown.subscribe();
-            tokio::spawn(session::accept_loop(listener, runtime, signal))
+            tokio::spawn(session::accept_loop(entry.listener, runtime, signal))
         })
         .collect();
 
@@ -357,6 +390,10 @@ mod tests {
 
     fn loopback_v4() -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
+    }
+
+    fn loopback_v6() -> SocketAddr {
+        SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0)
     }
 
     fn routable() -> SocketAddr {
@@ -547,6 +584,59 @@ mod tests {
             result,
             Err(ListenerError::Bind { addr, .. }) if addr == routable()
         ));
+    }
+
+    #[tokio::test]
+    async fn every_bound_address_is_reported_to_the_caller() {
+        // Arrange — port 0 twice, so the reported addresses can only come from
+        // the sockets themselves.
+        let config = ListenerConfig::new(
+            vec![loopback_v4(), loopback_v6()],
+            AuthSetting::Disabled,
+            false,
+        );
+
+        // Act
+        let handle = match start(config, Arc::new(StubDialer::default())).await {
+            Ok(handle) => handle,
+            Err(err) => panic!("loopback should bind: {err}"),
+        };
+
+        // Assert — a reported address that is not listening is the defect, so
+        // every one of them must accept a connection.
+        assert_eq!(
+            handle.listen_addrs().len() + handle.skipped_bind_addrs().len(),
+            2
+        );
+        for addr in handle.listen_addrs() {
+            assert_ne!(addr.port(), 0);
+            assert!(connect_to(*addr).await.is_ok(), "{addr} is not listening");
+        }
+        handle.shutdown().await;
+    }
+
+    /// The address a listener reports is read once, at bind time, and a socket
+    /// whose address cannot be read fails the bind rather than being dropped.
+    /// Discarding the error at reporting time instead makes such a socket vanish
+    /// from `listen_addrs` while its acceptor keeps running, so the GUI hands the
+    /// user a proxy URL for a port nothing answers on. A socket that refuses to
+    /// report its own address cannot be conjured from a test, so the guard is
+    /// that the lossy form does not exist in this file.
+    #[test]
+    fn a_listeners_address_is_never_dropped_on_the_way_to_the_caller() {
+        // Arrange
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("listener.rs");
+        let body = std::fs::read_to_string(&path).expect("listener.rs should be readable");
+        // Spelled in pieces so this test is not itself a match.
+        let lossy = concat!("local_addr", "().ok()");
+
+        // Act / Assert
+        assert!(
+            !body.contains(lossy),
+            "a failed address read must fail the bind, not silently drop the address"
+        );
     }
 
     /// SPEC.md §5.4 D3 says the ban on system name resolution is enforced by a

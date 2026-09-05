@@ -129,3 +129,98 @@ They share one exit-code vocabulary:
 The macOS probe pins with `IP_BOUND_IF`; the Linux probe binds the tun source address with
 `IP_BIND_ADDRESS_NO_PORT`, mirroring the unprivileged dialer in §5.3. Neither needs root itself —
 only the route setup does.
+
+## The live run — `verify-live-tunnel.sh`
+
+The two scripts above test *routing primitives* on synthetic interfaces. This one drives the real
+daemon, built from this tree, against a real server, and is the only thing in the repository that
+has ever carried a packet. It closes `docs/SPEC.md` §10 tests 2 and 3 and §13 open question 1.
+
+```sh
+sudo ./scripts/verify-live-tunnel.sh --profile ~/vpn/work.ovpn --confirm
+THISCONNECT_ECHO_URL=https://ifconfig.me/ip \
+  sudo -E ./scripts/verify-live-tunnel.sh --profile ~/vpn/work.ovpn --confirm
+```
+
+**What is under test is not the connection.** A VPN client that connects proves nothing. The
+verdict is a table of security properties, and a connection that succeeds while any of them fails
+is a worse outcome than one that never connects:
+
+| | Property | Failure means |
+|---|---|---|
+| A | The system default route is byte-for-byte unchanged **while connected** | §3.1 point 5 is broken: the client modifies the system stack |
+| B | A direct, non-proxied request still leaves via the normal interface with the same public IP | the machine's own connectivity was disturbed |
+| C | A request **through the proxy** returns a *different* public IP | proxied traffic is not traversing the tunnel; the product does nothing |
+| D | The daemon reports `local_dns_lookups == 0` for the session | names escaped the tunnel — §5.4 calls this a release blocker |
+| E | With the tunnel killed, a proxy request **fails** | the proxy is fail-**open**; users browse believing they are tunnelled |
+| F/G | The default route is unchanged after teardown and no route referencing the utun survives | a scoped default route pointing at a dead utun is a correctness *and* security hazard (§5.2) |
+
+**E is the file's reason to exist.** It `kill -KILL`s the daemon's own `openvpn` child — the daemon
+is not asked to disconnect — and then makes the proxy request twice: immediately, and again after a
+settle period. A pass is only ever downgraded by the second look, never upgraded, because a
+fail-open window that closes three seconds later is still a fail-open window. The loudest failure
+in the whole script is a proxy request that succeeds and answers with the **direct** public IP:
+nothing looked broken, and every byte left over the ISP link under the user's real identity.
+
+### Measurement honesty
+
+- The IP-echo endpoint defaults to `https://api.ipify.org` and is overridable with
+  `--echo-url` or `THISCONNECT_ECHO_URL`, for networks where it is blocked.
+- If the endpoint is unreachable **before** connecting, or answers with something that is not an IP
+  address (a captive portal returns HTML with a 200), the run exits **2 = SKIP** and says why.
+  Every assertion compares against that baseline, so a run that cannot measure must never report
+  `PASS`. Exit codes are `0` PASS, `1` FAIL, `2` SKIP.
+- A property that could not be measured — no proxy listener to ask, no DNS counters in the
+  response, no `openvpn` child to kill — is reported as `skip` with a sentence saying what was
+  *not* tested, and the headline becomes `PASS-WITH-GAPS`. It is never folded into a pass:
+  **`PASS-WITH-GAPS` exits `2` (SKIP)**, so an unfinished run is never green to a caller or a CI
+  job. `0` means every assertion in the table ran and held.
+- Two assertions are explicitly gated on the measurement having happened at all, because their
+  naive form passes on a session where nothing worked:
+  - **E (fail-closed)** runs only when **C (egress)** passed. Otherwise the post-kill request
+    would fail for the reason it was already failing, and a broken proxy would be printed as a
+    proven fail-closed property. When C did not pass, E is `skip`.
+  - **D (DNS)** reads `tunnel_dns_lookups` alongside `local_dns_lookups`. `local == 0` alone is
+    indistinguishable between "every name went through the tunnel" and "no name was ever
+    resolved"; D passes only on `local == 0` **and** `tunnel > 0`, and is `skip` when
+    `tunnel == 0`.
+- `curl` is invoked with `socks5h://`. `socks5://` resolves the hostname locally, which would pass
+  assertion C while leaking every name (§5.4 D8); the script refuses a proxy URL that is not
+  `socks5h://` even if the daemon offers one.
+
+### Secrets
+
+The profile will normally need a username and password, so the daemon sends a credential `prompt`
+over IPC as a daemon-initiated message (`docs/IPC.md` §6). The script answers it from the
+operator's terminal with `read -r` and `read -rs`, honouring the prompt's `echo` flag for
+challenge responses. Nothing sensitive is echoed, written to disk, or logged, and nothing
+sensitive is ever passed as an argument — `argv` is world-readable through `ps`. That constraint
+shapes two pieces of the implementation:
+
+- A small Python helper does the JSON encoding, reading the password (and the `.ovpn` body) from
+  **stdin**. Its escaping and its single-line framing are unit-tested, because framing is
+  load-bearing (`docs/IPC.md` §1).
+- The proxy password reaches `curl` through `--config -` on stdin, never `-x <url>`.
+
+The profile's contents, the CA, and any key material are never printed. On a validator rejection
+the script prints the daemon's own redacted error, never the file.
+
+### Isolation
+
+The daemon runs against `THISCONNECT_SOCKET`, `THISCONNECT_RUNTIME_DIR` and
+`THISCONNECT_STATE_DIR` inside one `mktemp -d`, removed by the `trap` on every exit path.
+`/var/run` and any system install are untouched, and the script adds no route, interface or
+resolver of its own — it only observes. When invoked through `sudo`, the `cargo build` is dropped
+back to `$SUDO_USER` so `target/` is not left owned by root.
+
+### What this run does *not* cover
+
+The daemon is built `--features dev-insecure-ipc`, which reduces the macOS authenticator to a uid
+check. It has to be: without it the authenticator is `UnimplementedCodeVerifier`, which denies
+every peer, and a shell script cannot present the GUI's designated requirement anyway. **IPC peer
+authentication (`docs/SPEC.md` §7.3) is therefore not exercised here**, and the verdict says so on
+every run rather than letting a reader assume otherwise.
+
+`--self-test` runs the pure decision functions — the verdict rules, the echo-answer validation, the
+`ps` and `netstat` parsers, the JSON helper's escaping — with no root and no network. CI runs it
+on every push, like the other two scripts.
