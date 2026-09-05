@@ -239,7 +239,10 @@ mod tests {
         if rendered.ends_with("route show table 218") {
             ok("unreachable default metric 4000\ndefault dev tun0 src 10.8.0.2 metric 100 mtu 1400\n")
         } else if rendered.ends_with("rule show") {
-            ok("18000:\tfrom 10.8.0.2 lookup 218\n18000:\tfrom fd00::2 lookup 218\n")
+            ok(
+                "18500:\tfrom 10.8.0.2 unreachable\n18500:\tfrom fd00::2 unreachable\n\
+                18000:\tfrom 10.8.0.2 lookup 218\n18000:\tfrom fd00::2 lookup 218\n",
+            )
         } else {
             ok("")
         }
@@ -271,30 +274,39 @@ mod tests {
             .iter()
             .position(|line| line.ends_with("route flush table 218"))
             .expect("cleanup ran");
-        let floor_at = log
+        let first_install_at = log
             .iter()
-            .position(|line| line.contains("route add unreachable"))
-            .expect("floor installed");
+            .position(|line| line.contains("rule add from 10.8.0.2/32 type unreachable"))
+            .expect("backstop installed");
         assert!(
-            flush_at < floor_at,
+            flush_at < first_install_at,
             "cleanup must precede the first install"
         );
     }
 
     #[test]
     fn a_failed_install_yields_no_installed_policy_and_leaves_nothing_behind() {
-        // The rule table never shows our rule, so verification of step two fails. The floor stops
-        // reading back once it is deleted, which is how the rollback proves the machine is clean.
+        // The backstop and the floor read back, our policy rule never does, so verification of the
+        // rule fails. Each stops reading back once deleted, which is how the rollback proves the
+        // machine is clean.
         let floor_removed = std::sync::atomic::AtomicBool::new(false);
+        let backstop_removed = std::sync::atomic::AtomicBool::new(false);
         let manager = linux_manager(move |command| {
             let rendered = command.to_string();
             if rendered.contains("route del unreachable") {
                 floor_removed.store(true, std::sync::atomic::Ordering::SeqCst);
             }
+            if rendered.contains("rule del from 10.8.0.2/32 type unreachable") {
+                backstop_removed.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
             if rendered.ends_with("route show table 218")
                 && !floor_removed.load(std::sync::atomic::Ordering::SeqCst)
             {
                 ok("unreachable default metric 4000\n")
+            } else if rendered.ends_with("rule show")
+                && !backstop_removed.load(std::sync::atomic::Ordering::SeqCst)
+            {
+                ok("18500:\tfrom 10.8.0.2 unreachable\n")
             } else {
                 ok("")
             }
@@ -310,6 +322,9 @@ mod tests {
         assert!(log
             .iter()
             .any(|line| line.contains("route del unreachable")));
+        assert!(log
+            .iter()
+            .any(|line| line.contains("rule del from 10.8.0.2/32 type unreachable")));
     }
 
     #[test]
@@ -339,9 +354,10 @@ mod tests {
             .into_iter()
             .filter(|line| line.contains(" del "))
             .collect();
-        assert_eq!(removals.len(), 6);
+        assert_eq!(removals.len(), 8);
         assert!(removals[0].contains("route del default dev tun0 src fd00::2"));
-        assert!(removals[5].contains("-4 route del unreachable"));
+        assert!(removals[6].contains("-4 route del unreachable"));
+        assert!(removals[7].contains("-4 rule del from 10.8.0.2/32 type unreachable"));
     }
 
     #[test]

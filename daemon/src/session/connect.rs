@@ -120,7 +120,12 @@ async fn start_openvpn(
     workspace.write_config(&profile.to_canonical_config())?;
 
     let transport = deps.transports.bind(workspace.socket_path())?;
-    let args = super::spawn::build_args(workspace.config_path(), workspace.socket_path())?;
+    let capabilities = super::spawn::detect_capabilities(&program);
+    let args = super::spawn::build_args(
+        workspace.config_path(),
+        workspace.socket_path(),
+        capabilities,
+    )?;
     let spawned = deps.spawner.spawn(&program, &args)?;
 
     info!(binary = %program.display(), "spawned openvpn");

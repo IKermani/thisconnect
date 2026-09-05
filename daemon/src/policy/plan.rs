@@ -16,6 +16,7 @@ use super::PolicyError;
 /// Ordering rank within one address family. Install ascends, teardown descends.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum StepKind {
+    Backstop,
     Floor,
     Rule,
     TunnelRoute,
@@ -24,6 +25,7 @@ pub enum StepKind {
 impl StepKind {
     fn label(self) -> &'static str {
         match self {
+            Self::Backstop => "fail-closed backstop rule",
             Self::Floor => "fail-closed floor route",
             Self::Rule => "policy rule",
             Self::TunnelRoute => "tunnel route",
@@ -133,9 +135,10 @@ pub struct Plan {
 }
 
 impl Plan {
-    /// Rejects any sequence that would install the floor after the rule, or the rule after the
-    /// route, within an address family. Encoding the invariant here means a platform backend
-    /// cannot regress it silently.
+    /// Rejects any sequence that would install the backstop after the floor, the floor after the
+    /// rule, or the rule after the route, within an address family. Encoding the invariant here
+    /// means a platform backend cannot regress it silently. Because teardown walks this order in
+    /// reverse, ranking the backstop first is also what makes it the last thing removed.
     pub fn new(steps: Vec<Step>) -> Result<Self, PolicyError> {
         for family in [Family::V4, Family::V6] {
             let ranks: Vec<StepKind> = steps
@@ -145,7 +148,8 @@ impl Plan {
                 .collect();
             if ranks.windows(2).any(|pair| pair[0] >= pair[1]) {
                 return Err(PolicyError::Ordering {
-                    detail: "policy steps must ascend floor -> rule -> route within a family",
+                    detail:
+                        "policy steps must ascend backstop -> floor -> rule -> route within a family",
                 });
             }
         }

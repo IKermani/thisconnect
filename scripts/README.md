@@ -2,14 +2,15 @@
 
 # Verification scripts
 
-These are not unit tests. They are the two experiments that decide whether the egress design in
-`docs/SPEC.md` §5.2 actually holds on a real kernel. Both modify system networking, both require
-root, and both refuse to do anything without `--confirm`.
+These are not unit tests. They are the experiments that decide whether the egress design in
+`docs/SPEC.md` §5.2 actually holds on a real kernel. All modify or observe system networking, all
+require root, and all refuse to do anything without `--confirm`.
 
 | Script | Platform | Proves |
 |---|---|---|
 | `verify-ifscope-macos.sh` | macOS | §10 test 1 — the one **[U]** claim in the whole design |
-| `verify-egress-linux.sh` | Linux | §10 tests 2 and 3 — the fail-closed floor and the rule |
+| `verify-egress-linux.sh` | Linux | §10 tests 2 and 3 — the fail-closed floor, the rule, and the backstop |
+| `verify-live-tunnel.sh` | macOS, Linux | §10 test 1 end to end against a real server — assertions A–G |
 
 ## Safety conventions
 
@@ -93,8 +94,8 @@ sudo ./scripts/verify-egress-linux.sh --confirm \
      --egress-check 10.8.0.2 --echo-url https://api.ipify.org
 ```
 
-Default run builds the §5.2 policy on a throwaway tun (floor route first, then rule, then the real
-route) and then:
+Default run builds the §5.2 policy on a throwaway tun (backstop rule, floor route, rule, then the
+real route) and then:
 
 - **Test 3, the floor.** Deletes the tunnel route from table 218 **with the tun address still
   present** and asserts `EHOSTUNREACH` (113). The address must still be there: with it gone the
@@ -103,14 +104,24 @@ route) and then:
 - **Test 3, the rule.** Deletes the `ip rule` and asserts the lookup does not fall through to table
   `main`. Both the probe errno and `ip route get <dst> from <tunip>` are inspected; a selected
   device that is not the tun is a `FAIL`, because packets bearing the tun source address would
-  leave over the physical link. If this fails, the netlink watcher in §5.2 is load-bearing rather
-  than defence in depth, and teardown order has to be re-derived.
+  leave over the physical link. A probe that merely hangs is also a `FAIL`: SOCKS5 has nothing to
+  reply with and the caller waits out `tcp_retries2`.
+
+  This assertion failed on its first run, which is why the backstop rule exists. The floor lives
+  *inside* table 218 and so cannot cover deletion of the rule that points at table 218; route
+  lookup is destination-keyed, and the table stops being consulted entirely. The backstop is a
+  second rule at priority 18500 catching the same source address, installed first and removed last.
+  Deleting *both* rules still leaks, so the netlink watcher in §5.2 remains required.
 - **Test 2, `--egress-check`.** Needs an *already-connected* tunnel whose policy the daemon has
   installed; the script does not create one. It compares an IP-echo response bound to the tun
   source address against an unbound one and asserts they differ.
 
 `blackhole` is deliberately not used anywhere: `RTN_BLACKHOLE` yields `EINVAL`, which maps to no
 SOCKS5 reply code. `RTN_UNREACHABLE` yields `EHOSTUNREACH`, which maps to REP `0x04`.
+
+The floor and the backstop answer with different errnos because they act at different layers:
+`FR_ACT_UNREACHABLE` on a *rule* yields `ENETUNREACH` (REP `0x03`), `RTN_UNREACHABLE` on a *route*
+yields `EHOSTUNREACH` (REP `0x04`). Both are mapped by the egress dialer.
 
 ## Probes
 
@@ -135,6 +146,13 @@ only the route setup does.
 The two scripts above test *routing primitives* on synthetic interfaces. This one drives the real
 daemon, built from this tree, against a real server, and is the only thing in the repository that
 has ever carried a packet. It closes `docs/SPEC.md` §10 tests 2 and 3 and §13 open question 1.
+
+It runs on macOS and Linux. The platform decides how the default route is snapshotted
+(`route -n get -inet default` against `ip -4 route show default`), how the routing table is
+searched for residue (`netstat -rn` against `ip route show table all`), and what a plausible tunnel
+device name looks like (`utunN` against `tunN`/`tapN`). On Linux the residue check additionally
+asserts that no `ip rule` survives at priority 18000 or 18500 and that table 218 is empty; a
+surviving rule fails the run even when no device name was captured.
 
 ```sh
 sudo ./scripts/verify-live-tunnel.sh --profile ~/vpn/work.ovpn --confirm

@@ -2,16 +2,24 @@
 
 //! Linux tunnel policy: a source-address rule into a private table (SPEC.md §5.2).
 //!
-//! UNTESTED ON LINUX. No Linux machine was available while this was written (SPEC.md §13 open
-//! question 2); every command below is transcribed from the specification and covered by unit
-//! tests over the argument vectors, which is not the same thing as having been run. It must be
-//! exercised on Debian stable and Fedora before it is trusted.
+//! Exercised on Ubuntu 24.04 / iproute2 6.1.0 by `scripts/verify-egress-linux.sh`, and end to end
+//! against a real server by `scripts/verify-live-tunnel.sh`. The v6 mirror below has still never
+//! run: every live tunnel so far has been v4-only. Not yet run on Debian stable or Fedora.
 //!
-//! Two details are load-bearing and must not be "simplified":
+//! Three details are load-bearing and must not be "simplified":
 //!
 //! * `unreachable`, never `blackhole`. `fib_props[]` maps `RTN_BLACKHOLE` to `-EINVAL` and
 //!   `RTN_UNREACHABLE` to `-EHOSTUNREACH`; `EINVAL` out of `connect()` is indistinguishable from
 //!   a caller bug and has no SOCKS5 reply code, while `EHOSTUNREACH` maps cleanly to REP `0x04`.
+//!   Observed: the floor answers `EHOSTUNREACH(113)` with the tun address still present, and a
+//!   matched `unreachable` route terminates the lookup rather than falling through to the next
+//!   rule — which is the property the whole fail-closed story rests on.
+//! * The backstop rule is not redundant with the floor. The floor lives *inside* table 218 and is
+//!   therefore unreachable once the policy rule is gone; deleting that rule was observed to fall
+//!   straight through to table `main` and out of the physical interface. The backstop is a second
+//!   rule at a lower priority that catches the same source address. Note the errno differs by
+//!   layer: `FR_ACT_UNREACHABLE` on a *rule* yields `ENETUNREACH` (REP `0x03`), where
+//!   `RTN_UNREACHABLE` on a *route* yields `EHOSTUNREACH` (REP `0x04`). Both are mapped.
 //! * No `rp_filter` sysctl is set. `__fib_validate_source()` performs the reverse lookup with the
 //!   tun IP as source, so it re-fires our rule and lands back in this table; strict RPF is already
 //!   survived. Because the effective value is `max(all, iface)`, writing the sysctl can only ever
@@ -22,8 +30,8 @@ use std::path::{Path, PathBuf};
 use super::command::{flag, value, Command, CommandRunner};
 use super::plan::{Check, Plan, Step, StepKind};
 use super::types::{
-    DeviceName, Family, TunnelEndpoint, TunnelSpec, FLOOR_METRIC, POLICY_TABLE, ROUTE_METRIC,
-    RULE_PRIORITY,
+    DeviceName, Family, TunnelEndpoint, TunnelSpec, BACKSTOP_PRIORITY, FLOOR_METRIC, POLICY_TABLE,
+    ROUTE_METRIC, RULE_PRIORITY,
 };
 use super::{PolicyError, TunnelPolicy};
 
@@ -69,7 +77,11 @@ impl TunnelPolicy for LinuxPolicy {
         spec.endpoints()
             .flat_map(|endpoint| {
                 let family = endpoint.family();
-                [self.rule_flush(family), self.table_flush(family)]
+                [
+                    self.backstop_flush(family),
+                    self.rule_flush(family),
+                    self.table_flush(family),
+                ]
             })
             .collect()
     }
@@ -90,10 +102,47 @@ impl LinuxPolicy {
         endpoint: &TunnelEndpoint,
     ) -> Result<Vec<Step>, PolicyError> {
         Ok(vec![
+            self.backstop_step(endpoint)?,
             self.floor_step(endpoint.family())?,
             self.rule_step(endpoint)?,
             self.route_step(spec.device(), endpoint, spec.mtu().to_string())?,
         ])
+    }
+
+    /// Catches the tun source address if the policy rule is ever removed out from under us, which
+    /// NetworkManager, systemd-networkd and other VPN clients all do on connectivity changes. It is
+    /// installed before anything else and removed after everything else, so no window exists in
+    /// which the address is routable but unprotected.
+    fn backstop_step(&self, endpoint: &TunnelEndpoint) -> Result<Step, PolicyError> {
+        let family = endpoint.family();
+        let selector = endpoint.local_host_cidr();
+        let spec = |verb: &'static str| {
+            Command::build(
+                &self.ip,
+                vec![
+                    flag(family.ip_flag()),
+                    flag("rule"),
+                    flag(verb),
+                    flag("from"),
+                    value(&selector),
+                    flag("type"),
+                    flag("unreachable"),
+                    flag("priority"),
+                    value(BACKSTOP_PRIORITY),
+                ],
+            )
+        };
+        let probe = self.rule_show(family)?;
+        // `ip rule show` drops the prefix length for a host selector and renders the action bare.
+        let rendered = format!("from {} unreachable", endpoint.local());
+        Ok(Step {
+            family,
+            kind: StepKind::Backstop,
+            apply: spec("add")?,
+            undo: spec("del")?,
+            after_apply: Some(Check::present(probe.clone(), vec![rendered.clone()])),
+            after_undo: Some(Check::absent(probe, vec![rendered])),
+        })
     }
 
     fn floor_step(&self, family: Family) -> Result<Step, PolicyError> {
@@ -146,10 +195,7 @@ impl LinuxPolicy {
                 ],
             )
         };
-        let probe = Command::build(
-            &self.ip,
-            vec![flag(family.ip_flag()), flag("rule"), flag("show")],
-        )?;
+        let probe = self.rule_show(family)?;
         let rendered = format!("from {} lookup {POLICY_TABLE}", endpoint.local());
         Ok(Step {
             family,
@@ -237,6 +283,21 @@ impl LinuxPolicy {
         )
     }
 
+    /// The backstop carries no `lookup` selector to key on, and deleting by action alone would
+    /// take an unrelated `unreachable` rule with it, so this deletes by the priority we own.
+    fn backstop_flush(&self, family: Family) -> Result<Command, PolicyError> {
+        Command::build(
+            &self.ip,
+            vec![
+                flag(family.ip_flag()),
+                flag("rule"),
+                flag("del"),
+                flag("priority"),
+                value(BACKSTOP_PRIORITY),
+            ],
+        )
+    }
+
     fn table_flush(&self, family: Family) -> Result<Command, PolicyError> {
         Command::build(
             &self.ip,
@@ -256,9 +317,15 @@ impl LinuxPolicy {
         family: Family,
     ) -> Result<Vec<Command>, PolicyError> {
         let lookup = format!("lookup {POLICY_TABLE}");
+        // `ip rule show` prefixes every line with the priority, which is the only marker a stale
+        // backstop carries; its source address belongs to a tun that no longer exists.
+        let backstop = format!("{BACKSTOP_PRIORITY}:");
         let rules = self.read(runner, self.rule_show(family)?)?;
         let table = self.read(runner, self.table_show(family)?)?;
         let mut cleanup = Vec::new();
+        if rules.contains(&backstop) {
+            cleanup.push(self.backstop_flush(family)?);
+        }
         if rules.contains(&lookup) {
             cleanup.push(self.rule_flush(family)?);
         }
@@ -269,10 +336,15 @@ impl LinuxPolicy {
     }
 
     /// A failed enumeration is fatal: assuming "nothing is there" would let a stale rule survive
-    /// into a session that believes it built its policy from nothing.
+    /// into a session that believes it built its policy from nothing. The one exception is a table
+    /// the kernel has never created, which is a positive answer — nothing is there — that iproute2
+    /// happens to report as an error.
     fn read(&self, runner: &dyn CommandRunner, command: Command) -> Result<String, PolicyError> {
         let output = runner.run(&command)?;
         if !output.succeeded() {
+            if is_absent_table(&output.stderr) {
+                return Ok(String::new());
+            }
             return Err(PolicyError::CommandFailed {
                 what: "policy state enumeration",
                 command: command.to_string(),
@@ -281,6 +353,14 @@ impl LinuxPolicy {
         }
         Ok(output.stdout)
     }
+}
+
+/// iproute2 is asymmetric here, which is why this is matched on text rather than exit status:
+/// `ip -4 route show table 218` exits 0 with no output when the table does not exist, while
+/// `ip -6 route show table 218` exits 2 with `Error: ipv6: FIB table does not exist.` — observed on
+/// iproute2 6.1.0. Treating that as fatal made startup reconciliation fail on every clean machine.
+fn is_absent_table(stderr: &str) -> bool {
+    stderr.contains("FIB table does not exist")
 }
 
 #[cfg(test)]
@@ -308,12 +388,13 @@ mod tests {
     }
 
     #[test]
-    fn installs_the_floor_then_the_rule_then_the_tunnel_route() {
+    fn installs_the_backstop_then_the_floor_then_the_rule_then_the_tunnel_route() {
         let plan = policy().plan(&tunnel()).expect("plan");
 
         assert_eq!(
             plan.install_commands(),
             vec![
+                "/usr/sbin/ip -4 rule add from 10.8.0.2/32 type unreachable priority 18500",
                 "/usr/sbin/ip -4 route add unreachable default table 218 metric 4000",
                 "/usr/sbin/ip -4 rule add from 10.8.0.2/32 lookup 218 priority 18000",
                 "/usr/sbin/ip -4 route add default dev tun0 src 10.8.0.2 table 218 metric 100 mtu 1400",
@@ -321,7 +402,12 @@ mod tests {
         );
         assert_eq!(
             plan.steps().iter().map(|s| s.kind).collect::<Vec<_>>(),
-            vec![StepKind::Floor, StepKind::Rule, StepKind::TunnelRoute]
+            vec![
+                StepKind::Backstop,
+                StepKind::Floor,
+                StepKind::Rule,
+                StepKind::TunnelRoute
+            ]
         );
     }
 
@@ -329,8 +415,8 @@ mod tests {
     fn the_floor_is_unreachable_and_never_blackhole() {
         let plan = policy().plan(&tunnel()).expect("plan");
 
-        let floor = plan.install_commands()[0].clone();
-        assert!(floor.contains("unreachable"));
+        let floor = plan.install_commands()[1].clone();
+        assert!(floor.contains("route add unreachable default"));
         assert!(!plan.install_commands().join(" ").contains("blackhole"));
     }
 
@@ -365,9 +451,11 @@ mod tests {
         assert_eq!(
             plan.install_commands(),
             vec![
+                "/usr/sbin/ip -4 rule add from 10.8.0.2/32 type unreachable priority 18500",
                 "/usr/sbin/ip -4 route add unreachable default table 218 metric 4000",
                 "/usr/sbin/ip -4 rule add from 10.8.0.2/32 lookup 218 priority 18000",
                 "/usr/sbin/ip -4 route add default dev tun0 src 10.8.0.2 table 218 metric 100 mtu 1400",
+                "/usr/sbin/ip -6 rule add from fd00::2/128 type unreachable priority 18500",
                 "/usr/sbin/ip -6 route add unreachable default table 218 metric 4000",
                 "/usr/sbin/ip -6 rule add from fd00::2/128 lookup 218 priority 18000",
                 "/usr/sbin/ip -6 route add default dev tun0 src fd00::2 table 218 metric 100 mtu 1400",
@@ -376,7 +464,7 @@ mod tests {
     }
 
     #[test]
-    fn teardown_removes_the_route_then_the_rule_then_the_floor() {
+    fn teardown_removes_the_route_then_the_rule_then_the_floor_then_the_backstop() {
         let plan = policy().plan(&tunnel()).expect("plan");
         let runner = ScriptedRunner::new(|_| ok(""));
 
@@ -393,6 +481,7 @@ mod tests {
                 "/usr/sbin/ip -4 route del default dev tun0 src 10.8.0.2 table 218 metric 100 mtu 1400",
                 "/usr/sbin/ip -4 rule del from 10.8.0.2/32 lookup 218 priority 18000",
                 "/usr/sbin/ip -4 route del unreachable default table 218 metric 4000",
+                "/usr/sbin/ip -4 rule del from 10.8.0.2/32 type unreachable priority 18500",
             ]
         );
     }
@@ -448,16 +537,50 @@ mod tests {
     }
 
     #[test]
-    fn pre_install_cleanup_flushes_the_rule_and_the_table() {
+    fn pre_install_cleanup_flushes_the_backstop_the_rule_and_the_table() {
         let commands = policy().pre_install_cleanup(&tunnel()).expect("cleanup");
 
         assert_eq!(
             commands.iter().map(Command::to_string).collect::<Vec<_>>(),
             vec![
+                "/usr/sbin/ip -4 rule del priority 18500",
                 "/usr/sbin/ip -4 rule del lookup 218",
                 "/usr/sbin/ip -4 route flush table 218",
             ]
         );
+    }
+
+    #[test]
+    fn an_absent_table_reads_as_empty_rather_than_as_a_failed_enumeration() {
+        // A clean machine has never had table 218, and `ip -6` reports that as an error.
+        let runner = ScriptedRunner::new(|command| {
+            if command.to_string().contains("route show table") {
+                failed("Error: ipv6: FIB table does not exist.\nDump terminated\n")
+            } else {
+                ok("0:\tfrom all lookup local\n")
+            }
+        });
+
+        let commands = policy()
+            .stale_cleanup(&runner)
+            .expect("clean machine reconciles");
+
+        assert!(commands.is_empty());
+    }
+
+    #[test]
+    fn a_real_enumeration_failure_is_still_fatal() {
+        let runner = ScriptedRunner::new(|command| {
+            if command.to_string().contains("route show table") {
+                failed("Error: Operation not permitted\n")
+            } else {
+                ok("0:\tfrom all lookup local\n")
+            }
+        });
+
+        let outcome = policy().stale_cleanup(&runner);
+
+        assert!(matches!(outcome, Err(PolicyError::CommandFailed { .. })));
     }
 
     #[test]

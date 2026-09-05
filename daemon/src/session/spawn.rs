@@ -73,16 +73,78 @@ fn is_executable_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// What the resolved `openvpn` accepts. Options that do not exist on every supported release
+/// cannot simply be passed: openvpn rejects an unknown option and exits before it connects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OpenvpnCapabilities {
+    /// `--dns-updown` exists from 2.7. On 2.6 there is no built-in dns-updown handler to disable,
+    /// so omitting it there loses nothing — but the flag is a security control, so the default is
+    /// to pass it and only positive proof of rejection takes it away.
+    pub dns_updown: bool,
+}
+
+impl Default for OpenvpnCapabilities {
+    fn default() -> Self {
+        Self { dns_updown: true }
+    }
+}
+
+/// openvpn names the option it could not parse, so asking it to parse the option and print its
+/// version answers the question directly. This is deliberately not a version comparison: a distro
+/// that backports `--dns-updown` into a 2.6 build would still get the security control, where a
+/// version test would silently drop it.
+///
+/// Every ambiguous outcome — probe failed to run, unreadable output, some other error — keeps the
+/// capability enabled, because the failure that matters is dropping the flag on a release whose
+/// built-in handler runs as root.
+pub fn detect_capabilities(program: &Path) -> OpenvpnCapabilities {
+    OpenvpnCapabilities {
+        dns_updown: probe_accepts(program, &["--dns-updown", "disable"], "dns-updown"),
+    }
+}
+
+fn probe_accepts(program: &Path, args: &[&str], option: &str) -> bool {
+    let output = std::process::Command::new(program)
+        .args(args)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .output();
+    let Ok(output) = output else {
+        warn!(
+            option,
+            "could not probe openvpn for option support; assuming it is supported"
+        );
+        return true;
+    };
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    !rejects_option(&text, option)
+}
+
+/// `Options error: Unrecognized option or missing or extra parameter(s) in [CMD-LINE]:1: <option>`
+fn rejects_option(output: &str, option: &str) -> bool {
+    output
+        .lines()
+        .any(|line| line.contains("Unrecognized option") && line.contains(option))
+}
+
 /// The daemon-injected flags, appended last.
 ///
 /// Order matters: `script_security_set()` is applied per occurrence in parse
 /// order and last-wins, so a profile that somehow carried a `script-security`
 /// line could not raise ours. `--route-nopull` is deliberately absent — it
 /// suppresses pushed DNS too and makes leak-free resolution impossible.
-pub fn build_args(config: &Path, socket: &Path) -> Result<Vec<String>, SessionError> {
+pub fn build_args(
+    config: &Path,
+    socket: &Path,
+    capabilities: OpenvpnCapabilities,
+) -> Result<Vec<String>, SessionError> {
     let config = utf8(config)?;
     let socket = utf8(socket)?;
-    Ok(vec![
+    let mut args: Vec<String> = vec![
         "--config".into(),
         config,
         "--management".into(),
@@ -101,16 +163,21 @@ pub fn build_args(config: &Path, socket: &Path) -> Result<Vec<String>, SessionEr
         "ignore".into(),
         "redirect-gateway".into(),
         "--route-noexec".into(),
-        "--dns-updown".into(),
-        "disable".into(),
-        "--allow-compression".into(),
-        "no".into(),
-        "--auth-retry".into(),
-        "interact".into(),
-        "--auth-nocache".into(),
-        "--verb".into(),
-        "3".into(),
-    ])
+    ];
+    if capabilities.dns_updown {
+        args.push("--dns-updown".into());
+        args.push("disable".into());
+    }
+    args.extend([
+        "--allow-compression".to_owned(),
+        "no".to_owned(),
+        "--auth-retry".to_owned(),
+        "interact".to_owned(),
+        "--auth-nocache".to_owned(),
+        "--verb".to_owned(),
+        "3".to_owned(),
+    ]);
+    Ok(args)
 }
 
 fn utf8(path: &Path) -> Result<String, SessionError> {
@@ -277,9 +344,14 @@ mod tests {
     use super::*;
 
     fn args() -> Vec<String> {
+        args_with(OpenvpnCapabilities::default())
+    }
+
+    fn args_with(capabilities: OpenvpnCapabilities) -> Vec<String> {
         build_args(
             Path::new("/run/tc/canonical.ovpn"),
             Path::new("/run/tc/mgmt.sock"),
+            capabilities,
         )
         .expect("args")
     }
@@ -342,6 +414,51 @@ mod tests {
             window(&args(), "--dns-updown")[..2],
             ["--dns-updown", "disable"]
         );
+    }
+
+    #[test]
+    fn omits_dns_updown_only_when_the_binary_cannot_parse_it() {
+        // openvpn 2.6 rejects an unknown option and exits before it connects, so passing it there
+        // is not a harmless extra flag — it is a total failure to start.
+        let without = args_with(OpenvpnCapabilities { dns_updown: false });
+
+        assert!(!without.iter().any(|a| a == "--dns-updown"));
+        assert!(!without.iter().any(|a| a == "disable"));
+        // Everything after it must survive its removal.
+        assert_eq!(
+            window(&without, "--allow-compression")[..2],
+            ["--allow-compression", "no"]
+        );
+        assert_eq!(
+            window(&without, "--auth-retry")[..2],
+            ["--auth-retry", "interact"]
+        );
+        assert!(without.iter().any(|a| a == "--auth-nocache"));
+        assert_eq!(window(&without, "--verb")[..2], ["--verb", "3"]);
+        assert_eq!(window(&without, "--route-noexec")[..1], ["--route-noexec"]);
+    }
+
+    #[test]
+    fn the_capability_default_keeps_the_security_control() {
+        assert!(OpenvpnCapabilities::default().dns_updown);
+    }
+
+    #[test]
+    fn recognises_the_option_rejection_openvpn_prints() {
+        let rejection = "Options error: Unrecognized option or missing or extra parameter(s) in \
+                         [CMD-LINE]:1: dns-updown (2.6.19)";
+
+        assert!(rejects_option(rejection, "dns-updown"));
+        // A build that accepts it prints its version banner and nothing else.
+        assert!(!rejects_option(
+            "OpenVPN 2.7.6 aarch64-apple-darwin25.6.0 [SSL (OpenSSL)]",
+            "dns-updown"
+        ));
+        // A rejection naming a different option must not disable this one.
+        assert!(!rejects_option(
+            "Options error: Unrecognized option or missing or extra parameter(s) in [CMD-LINE]:1: nonsense",
+            "dns-updown"
+        ));
     }
 
     #[test]

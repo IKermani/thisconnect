@@ -150,7 +150,7 @@ parse order, last-wins **[V]** (`options.c:7152`):
 --pull-filter ignore "route"
 --pull-filter ignore "redirect-gateway"
 --route-noexec
---dns-updown disable
+--dns-updown disable          # only when the binary accepts it; see below
 --allow-compression no
 --auth-retry interact
 --auth-nocache
@@ -164,9 +164,23 @@ Each of these is load-bearing:
   to fatal error` **[V]**.
 - **`--script-security 1`, not 0.** Level 0 breaks the tunnel: `tun.c:1455` execve's `/sbin/ifconfig`
   for macOS tun bring-up with no `S_SCRIPT` flag **[V]**. Level 1 permits built-ins only.
-- **`--dns-updown disable`.** The *built-in* dns-updown handler runs via `openvpn_execve_check()`
-  **without** `S_SCRIPT` (`dns.c:588-597`) **[V]** — so it executes as root even at script-security 1.
-  Disabling it is a security control, not a preference.
+- **`--dns-updown disable`, when the binary has the option.** The *built-in* dns-updown handler
+  runs via `openvpn_execve_check()` **without** `S_SCRIPT` (`dns.c:588-597`) **[V]** — so it
+  executes as root even at script-security 1. Disabling it is a security control, not a preference.
+
+  The option does not exist before 2.7. openvpn 2.6.19 answers
+  `Options error: Unrecognized option or missing or extra parameter(s) in [CMD-LINE]:1: dns-updown`
+  and exits 1 **before connecting** **[V]** — so passing it unconditionally makes the daemon
+  unable to start on the 2.6 floor this document sets, which is what Ubuntu 24.04 and Debian ship.
+  2.6.19 has the `--dns` family but no dns-updown handler at all: no such string in the binary, no
+  helper under `/usr/libexec/openvpn`, no man entry **[V]**. There is nothing to disable there.
+
+  The daemon therefore probes the resolved binary once per connect, by asking it to parse the
+  option and print its version, and omits the flag only when openvpn names it as unrecognised.
+  This is deliberately **not** a version comparison: a distro that backports `--dns-updown` into a
+  2.6 build still gets the security control, where a version test would silently drop it. Every
+  ambiguous outcome keeps the flag, because the failure that matters is dropping it on a release
+  whose handler runs as root.
 - **`--auth-retry interact`, never `nointeract`.** `nointeract` retries without re-querying
   credentials, replaying an already-consumed TOTP until the account locks **[V]**. `interact` is
   also required for CRV1 dynamic challenge to work at all.
@@ -225,7 +239,9 @@ Contract:
    `ifconfig_ipv6_local`), which is why `--management-up-down` is mandatory. `>UPDOWN` is
    undocumented in `management-notes.txt`, so it is not a stability contract — an integration test
    must assert `dev=` is present on every supported openvpn version, and a missing `dev=` is a hard
-   error, not a warning: §5 egress binding has nothing to bind to without it.
+   error, not a warning: §5 egress binding has nothing to bind to without it. Confirmed on the
+   floor: openvpn 2.6.19 emits the block with a usable `dev=`, captured as `tun0` in a live run
+   **[V]**. The block was the most likely thing to differ between 2.6 and 2.7 and did not.
 7. **Credentials.** Implement all four prompt shapes: plain `Need 'Auth' username/password`;
    `SC:<flag>,<text>` static challenge (SCRV1 base64 for FORMAT=0, plain concat for FORMAT=1);
    CRV1 dynamic challenge parsed from `Verification Failed: '<type>' ['<reason>']`; and
@@ -238,6 +254,14 @@ Contract:
    no error **[V]**. Refuse to send any line > 900 bytes; use the multiline base64 password form
    above 256 bytes per parameter.
 10. **Version floor.** Assert management version ≥ 5 (openvpn 2.6) at startup; refuse to run below.
+    Announce no more than the peer greeted with, and **do not await a reply to `version <n>` below
+    management version 6**. openvpn 2.6.19 greets with version 5 and answers `version <n>` with
+    silence for every n **[V]**; 2.7.6 answers **[V]**. Awaiting it on 2.6 consumes the 10s command
+    timeout and then tears the channel down — the connect fails with "the management channel is
+    desynchronised" and never reaches the credential prompt. The reply must still be awaited on 6,
+    or it lands on `state on` and every reply after it is off by one. A command known to go
+    unanswered must not occupy the pending slot at all: that slot is what makes the next reply
+    attributable, and the protocol carries no correlation id.
 
 ### 4.4 Logging
 
@@ -259,11 +283,13 @@ socket into that scope.
 **Linux** — policy routing keyed on source address:
 
 ```sh
-# 1. fail-closed floor FIRST, and it outlives individual connections
+# 1. backstop FIRST: the only layer that survives deletion of the rule in step 3
+ip rule add from <tunip>/32 type unreachable priority 18500
+# 2. fail-closed floor, which outlives individual connections
 ip route add unreachable default table 218 metric 4000
-# 2. rule
+# 3. rule
 ip rule add from <tunip>/32 lookup 218 priority 18000
-# 3. real route
+# 4. real route
 ip route add default dev <tun> src <tunip> table 218 metric 100 mtu <tunmtu>
 ```
 
@@ -272,17 +298,39 @@ Mirrored for IPv6 when the tun has a v6 address; otherwise the proxy refuses `AF
 - **`unreachable`, not `blackhole`.** `fib_props[]` in `net/ipv4/fib_semantics.c`: `RTN_BLACKHOLE`
   → `-EINVAL`, `RTN_UNREACHABLE` → `-EHOSTUNREACH` **[V]**. `EINVAL` from `connect()` is
   indistinguishable from a caller bug and maps to no SOCKS5 reply code; `EHOSTUNREACH` maps
-  cleanly to REP `0x04`.
+  cleanly to REP `0x04`. Observed on Ubuntu 24.04 / iproute2 6.1.0: with the tun address still
+  present, deleting the tunnel route yields `EHOSTUNREACH(113)`, and a matched `unreachable`
+  route *terminates* the lookup rather than falling through to the next rule **[V]**.
+
+- **The backstop rule is not redundant with the floor.** The floor lives inside table 218 and is
+  therefore unreachable the moment the policy rule is gone. Deleting that rule was observed to fall
+  straight through to table `main` and out of the physical interface — a silent leak **[V]**. No
+  content of table 218 can prevent this, because route lookup is destination-keyed and table 218 is
+  not consulted at all once the rule is gone. Hence a second rule, at a lower priority, matching the
+  same source address. Note the errno differs by layer: `FR_ACT_UNREACHABLE` on a *rule* yields
+  `ENETUNREACH` → REP `0x03`, where `RTN_UNREACHABLE` on a *route* yields `EHOSTUNREACH` → REP
+  `0x04`. Both are already mapped by the egress dialer **[V]**. Deleting *both* rules still leaks,
+  which is why the netlink watcher below remains required rather than optional.
 - **No `rp_filter` sysctl.** Source-address binding provably survives strict reverse-path
   filtering: `__fib_validate_source()` sets `fl4.daddr = src; fl4.saddr = dst`, so the RPF reverse
   lookup carries the tun IP as source, re-fires the `from <tunip>` rule, and lands in table 218
   **[V]**. Setting `rp_filter=2` is a no-op at best; because the effective value is
   `max(all, iface)` it can only ever *enable* loose RPF on systems that had none.
+- **An absent table is an answer, not an error.** `ip -4 route show table 218` exits 0 with no
+  output when the table does not exist, but `ip -6 route show table 218` exits 2 with
+  `Error: ipv6: FIB table does not exist.` — iproute2 6.1.0 **[V]**. Since state enumeration
+  otherwise treats a non-zero exit as fatal (assuming "nothing is there" would let a stale rule
+  survive), that asymmetry made startup reconciliation fail on every clean machine. That one
+  stderr is matched and read as empty; every other failure stays fatal.
+
 - **Netlink watcher.** Watch `RTM_NEWRULE`, `RTM_DELRULE`, `RTM_DELROUTE`, `RTM_DELADDR` and
   re-assert. NetworkManager, systemd-networkd, and other VPN clients rewrite policy routing;
   Tailscale issue #2325 documents rules being discarded on connectivity changes.
-- **Teardown order:** stop listener → kill live sessions → remove rule → remove table. The floor
-  route is removed last, and only after the rule is confirmed gone.
+- **Teardown order:** stop listener → kill live sessions → remove tunnel route → remove rule →
+  remove floor → remove backstop. The backstop is removed last, and only after the rule is confirmed
+  gone; it is the outermost layer, so it is installed first and torn down last. Every intermediate
+  state fails closed. `Plan` encodes this as an ordering invariant over `StepKind`, and teardown
+  walks it in reverse, so a backend cannot regress the order silently.
 
 **macOS** — interface-scoped routing:
 
@@ -753,12 +801,38 @@ claim, not a guarantee.
    | F. default route unchanged after teardown | byte-for-byte identical |
    | G. no route residue | no scoped route referencing the utun survived |
 
+   **[V] — ALSO PASSED on Linux.** Same harness, same seven assertions, on Ubuntu 24.04 with
+   openvpn 2.6.19 and iproute2 6.1.0, against a real credentialed profile. `tun0` captured from
+   `>UPDOWN`; C returned the exit address where the direct route returned the ISP's; D counted 0
+   local against 1 tunnelled; E failed closed both immediately (`curl rc=97`) and after 3s
+   (`rc=7`); G confirmed no route referencing `tun0`, no `ip rule` at priority 18000 or 18500, and
+   no table 218 entry survived.
+
+   Reaching that run took four Linux-only defects, none of which any passing unit test showed: the
+   daemon did not build (`totp-rs` and `keyring` were in the macOS-only dependency block while
+   `mod auth` is not cfg-gated); deleting the policy rule leaked to table `main` (§5.2, fixed with
+   the backstop rule); startup reconciliation failed on every clean machine (`ip -6 route show`
+   reports an absent table as an error where `ip -4` reports success); and the management
+   handshake stalled because 2.6.19 answers `version <n>` with silence (§4.3 point 10).
+
    Not covered: IPC peer authentication. The harness must build with `dev-insecure-ipc` because no
    shell script can present the GUI's code signature; §7.3 is covered by its own tests.
-3. **Fail-closed floor (Linux).** **[U]** With the tun IP **still present**, delete the tunnel route
-   from table 218 and assert `connect()` returns `EHOSTUNREACH` from the floor route. This is the
-   only test that exercises the floor. Separately, delete the `ip rule` and assert failure rather
-   than fall-through to `main`. `scripts/verify-egress-linux.sh` is written and has never run.
+3. **Fail-closed floor and backstop (Linux).** **[V]** With the tun IP **still present**, delete the
+   tunnel route from table 218 and assert `connect()` returns `EHOSTUNREACH` from the floor route.
+   This is the only test that exercises the floor. Separately, delete the `ip rule` and assert
+   failure rather than fall-through to `main`. Run under `sudo` on Ubuntu 24.04 / iproute2 6.1.0 by
+   `scripts/verify-egress-linux.sh`:
+
+   | Case | Result |
+   |---|---|
+   | Full policy installed, socket bound to the tun IP | `PENDING` — route lookup cleared, nothing answers |
+   | Tunnel route deleted, tun address still present | `EHOSTUNREACH(113)` — the floor, not a missing address |
+   | Policy rule deleted, **no backstop** | fell through to `main` via the physical link — **leak** |
+   | Policy rule deleted, backstop installed | `ENETUNREACH(101)` — fails closed |
+   | Default route, during and after | byte-for-byte unchanged, no residue |
+
+   The third row is why the backstop exists; it was a real finding, not a hypothetical. The
+   remaining gap is a Debian stable and Fedora run.
 
 A tun-flap test is worth keeping but must be labelled honestly: it tests `bind()` returning
 `EADDRNOTAVAIL`, **not** the routing policy. It passes with no rule and no floor installed, which is
@@ -767,7 +841,8 @@ exactly why it cannot stand in for test 3.
 Also required:
 - `PUSH_REPLY` DNS-capture parser against a corpus of real lines from several server types.
 - Management-interface escaping matrix (quotes, backslashes, leading/trailing spaces).
-- `>UPDOWN:ENV` contains `dev=` on every supported openvpn version.
+- `>UPDOWN:ENV` contains `dev=` on every supported openvpn version. Confirmed for 2.6.19 and
+  2.7.6 **[V]**; still an assertion worth keeping for versions beyond those two.
 - Profile-validator corpus: every hard-reject directive, every inline-tag bypass, real-world
   profiles from common providers that must *pass*.
 - CI asserts `dev-insecure-ipc` is off in release artifacts.
@@ -812,12 +887,16 @@ for.** Publish reproducible builds and checksums early so "verify it yourself" i
 
 1. **Nothing on macOS.** §10 tests 1 and 2 both passed against a real server; the macOS half of the
    design is verified rather than argued.
-2. **Everything on Linux.** Not one command in §5.2's Linux half has ever executed: the policy
-   module is transcribed from the spec and covered only by argument-vector tests, and
-   `scripts/verify-egress-linux.sh` has never run. The `ip rule del lookup 218` selector form, the
-   `mtu` argument on `ip route add`, and the exact `ip rule show` substring the verification
-   matches on all need confirming on Debian stable and Fedora. This is now the largest unverified
-   surface in the project.
+2. **Linux, partially closed.** §5.2's routing half now runs: `scripts/verify-egress-linux.sh`
+   passed under `sudo` on Ubuntu 24.04 / iproute2 6.1.0, and the `ip rule del lookup 218` selector
+   form, the `mtu` argument on `ip route add`, and the exact `ip rule show` substring the
+   verification matches on (`from <ip> lookup 218`, rendered without the `/32`) were all confirmed
+   directly. `scripts/verify-live-tunnel.sh` now runs on Linux as well as macOS, and its residue
+   check knows about `ip rule` and table 218 rather than assuming the macOS model. Still open: a
+   live-tunnel run passed on Ubuntu 24.04 / openvpn 2.6.19 / iproute2 6.1.0 with all seven
+   assertions green, which also settles the `>UPDOWN` device capture on the 2.6 floor. Still open:
+   a Debian stable and Fedora run, and IPv6 — every run so far had a v4-only tunnel, so the v6
+   mirror of §5.2 remains transcribed rather than executed.
 3. Linux distro matrix for §5.2 — every routing, teardown, and RPF claim needs verification on at
    least Debian stable and Fedora. No Linux machine was available during research.
 4. Whether to ship full-tunnel mode in v1.0 after all. It is what most users expect, and the daemon
