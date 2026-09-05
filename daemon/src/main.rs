@@ -33,6 +33,7 @@ use peerauth::lookup_group_id;
 use peerauth::AUTHORISED_GROUP;
 use peerauth::{authenticator, PeerPolicy};
 use policy::{PolicyManager, SystemRunner};
+use session::proxy::{ProxyPublisher, ProxySettings, ProxyStatus, UnavailableRuntime};
 use session::store::ProfileStore;
 use session::tunnel::{ManagedPolicy, TunnelPolicyDriver};
 use session::{system_deps, SessionConfig, SessionManager};
@@ -231,6 +232,21 @@ async fn reconcile_startup_state(session: &SessionManager) {
     }
 }
 
+/// The proxy listener, attached to the tunnel lifecycle.
+///
+/// The listener itself lives in the unprivileged `thisconnect-proxy` crate, which
+/// this binary does not link: `UnavailableRuntime` is what stands in for it, and
+/// it refuses to publish rather than letting a tunnel come up that nothing can
+/// egress through (SPEC.md §3.1 point 5). Replacing it with the real adapter is
+/// the only change this function needs.
+fn proxy_publisher(config: &SessionConfig) -> Arc<ProxyPublisher> {
+    warn!("no proxy worker is linked into this build; connecting will fail once the tunnel is up, rather than coming up with no way to use it");
+    Arc::new(ProxyPublisher::new(
+        Arc::new(UnavailableRuntime),
+        ProxySettings::from_config(config),
+    ))
+}
+
 fn tunnel_policy() -> Result<Arc<dyn TunnelPolicyDriver>> {
     let manager = PolicyManager::for_platform(SystemRunner)
         .map_err(|error| anyhow::anyhow!("tunnel policy is unavailable: {error}"))?;
@@ -266,7 +282,14 @@ async fn main() -> Result<()> {
     let catalog: Arc<dyn ProfileStore> = Arc::new(session::profiles::FileProfileStore::new(
         &config.profile_dir,
     ));
-    let deps = system_deps(&config, tunnel_policy()?, secrets, outbound.clone());
+    let proxy = proxy_publisher(&config);
+    let deps = system_deps(
+        &config,
+        tunnel_policy()?,
+        secrets,
+        outbound.clone(),
+        Arc::clone(&proxy),
+    );
     let session = SessionManager::new(config, deps, outbound);
 
     reconcile_startup_state(&session).await;
@@ -283,7 +306,11 @@ async fn main() -> Result<()> {
     IpcServer::new(
         listener,
         authenticator,
-        handler::shared(session.clone(), catalog),
+        handler::shared(
+            session.clone(),
+            catalog,
+            Arc::clone(&proxy) as Arc<dyn ProxyStatus>,
+        ),
         inbound,
     )
     .run(shutdown_rx)

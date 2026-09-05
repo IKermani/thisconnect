@@ -262,6 +262,22 @@ impl Bucket {
     }
 }
 
+/// The tracked peer with the most tokens left, i.e. the one whose throttle
+/// state is closest to meaningless.
+fn most_refilled(buckets: &HashMap<IpAddr, Bucket>, now: Instant) -> Option<IpAddr> {
+    buckets
+        .iter()
+        .max_by(|(_, a), (_, b)| {
+            a.refilled(now)
+                .tokens
+                .partial_cmp(&b.refilled(now).tokens)
+                // Token counts are finite by construction, so this arm is
+                // unreachable; ordering them equal keeps eviction total.
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(peer, _)| *peer)
+}
+
 /// Token bucket over failed authentications, keyed on source IP: 5 per minute
 /// (SPEC.md §5.6 L5).
 #[derive(Debug, Default)]
@@ -300,6 +316,20 @@ impl AuthRateLimiter {
         if buckets.len() >= MAX_TRACKED_PEERS && !buckets.contains_key(&peer) {
             // Idle peers have refilled to capacity and carry no information.
             buckets.retain(|_, bucket| bucket.refilled(now).tokens < AUTH_FAILURE_BURST);
+
+            // Refilling alone is not a bound: a flood from more than
+            // MAX_TRACKED_PEERS distinct sources inside one refill window leaves
+            // every bucket partially drained, so the retain above evicts nothing
+            // and the map grows without limit. Evict the peer closest to
+            // refilled — the least-throttled, and so the least worth tracking —
+            // until there is room. Keeping the most-drained peers means an
+            // attacker cannot flush their own throttle by flooding from others.
+            while buckets.len() >= MAX_TRACKED_PEERS {
+                let Some(evict) = most_refilled(&buckets, now) else {
+                    break;
+                };
+                buckets.remove(&evict);
+            }
         }
         buckets.insert(peer, next);
     }
@@ -1032,6 +1062,48 @@ mod tests {
         // Assert
         assert!(!limiter.has_capacity_at(peer(), now));
         assert!(limiter.has_capacity_at(peer(), now + Duration::from_secs(13)));
+    }
+
+    #[test]
+    fn rate_limiter_map_stays_bounded_under_a_distributed_flood() {
+        // Arrange: every source fails once at the same instant, so no bucket
+        // ever refills and the retain pass has nothing to evict.
+        let limiter = AuthRateLimiter::new();
+        let now = Instant::now();
+
+        // Act: more distinct sources than the cap, which is the shape of a
+        // botnet probing a non-loopback listener.
+        for i in 0..(MAX_TRACKED_PEERS + 500) {
+            let octets = ((i as u32) + 1).to_be_bytes();
+            let source = IpAddr::V4(Ipv4Addr::new(10, octets[1], octets[2], octets[3]));
+            limiter.record_failure_at(source, now);
+        }
+
+        // Assert: memory is bounded rather than growing with the attacker's
+        // source count.
+        assert!(limiter.lock().len() <= MAX_TRACKED_PEERS);
+    }
+
+    #[test]
+    fn rate_limiter_evicting_under_pressure_keeps_the_most_throttled_peer() {
+        // Arrange: one source is fully throttled, then a flood arrives.
+        let limiter = AuthRateLimiter::new();
+        let now = Instant::now();
+        for _ in 0..5 {
+            limiter.record_failure_at(peer(), now);
+        }
+        assert!(!limiter.has_capacity_at(peer(), now));
+
+        // Act
+        for i in 0..(MAX_TRACKED_PEERS + 100) {
+            let octets = ((i as u32) + 1).to_be_bytes();
+            let source = IpAddr::V4(Ipv4Addr::new(10, octets[1], octets[2], octets[3]));
+            limiter.record_failure_at(source, now);
+        }
+
+        // Assert: an attacker cannot clear their own throttle by flooding from
+        // other addresses.
+        assert!(!limiter.has_capacity_at(peer(), now));
     }
 
     #[test]

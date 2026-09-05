@@ -13,10 +13,11 @@ use thisconnect_shared::ipc::{
     ClientMessage, DaemonMessage, ErrorCode, IpcError, PromptId, PromptReply, Request, RequestId,
     Response,
 };
-use tracing::{debug, warn};
+use tracing::warn;
 
 use crate::auth::prompt::PromptError;
 use crate::ipc::MessageHandler;
+use crate::session::proxy::ProxyStatus;
 use crate::session::store::ProfileStore;
 use crate::session::{SessionError, SessionManager};
 
@@ -26,11 +27,22 @@ pub struct SessionHandler {
     /// reachable while disconnected, so it hangs off the handler rather than
     /// being threaded through the connection state machine.
     catalog: Arc<dyn ProfileStore>,
+    /// The same publisher the connect path publishes the tunnel to, asked here
+    /// only what it is currently listening on.
+    proxy: Arc<dyn ProxyStatus>,
 }
 
 impl SessionHandler {
-    pub fn new(session: SessionManager, catalog: Arc<dyn ProfileStore>) -> Self {
-        Self { session, catalog }
+    pub fn new(
+        session: SessionManager,
+        catalog: Arc<dyn ProfileStore>,
+        proxy: Arc<dyn ProxyStatus>,
+    ) -> Self {
+        Self {
+            session,
+            catalog,
+            proxy,
+        }
     }
 
     /// The GUI vocabulary. Every arm answers with exactly one message, so a
@@ -92,19 +104,17 @@ impl SessionHandler {
                     Err(error) => fail(id, error),
                 }
             }
-            // Proxy credentials and statistics belong to the proxy listener,
-            // which is not started yet; saying so beats inventing a shape the
-            // GUI would cache.
-            other => {
-                debug!(request = ?other, "unimplemented request");
-                error(
-                    id,
-                    IpcError::new(
-                        ErrorCode::Internal,
-                        "this request is not implemented in this build",
-                    ),
-                )
-            }
+            // Both proxy answers exist only while the listener does. Before that
+            // there is nothing true to say, and an empty shape is one the GUI
+            // would cache and show as a working proxy.
+            Request::ProxyInfo => match self.proxy.info() {
+                Some(proxy) => ok(id, Response::Proxy { proxy }),
+                None => error(id, not_ready()),
+            },
+            Request::ProxyStats => match self.proxy.stats() {
+                Some(stats) => ok(id, Response::ProxyStats { stats }),
+                None => error(id, not_ready()),
+            },
         }
     }
 
@@ -158,6 +168,13 @@ fn ok(id: RequestId, response: Response) -> DaemonMessage {
     DaemonMessage::Response { id, response }
 }
 
+fn not_ready() -> IpcError {
+    IpcError::new(
+        ErrorCode::TunnelNotReady,
+        "the proxy listener is not up; connect a profile first",
+    )
+}
+
 fn error(id: RequestId, error: IpcError) -> DaemonMessage {
     DaemonMessage::Error { id, error }
 }
@@ -185,8 +202,12 @@ fn code_for(error: &SessionError) -> ErrorCode {
 }
 
 /// Convenience for the IPC server: a handler behind an `Arc`.
-pub fn shared(session: SessionManager, catalog: Arc<dyn ProfileStore>) -> Arc<SessionHandler> {
-    Arc::new(SessionHandler::new(session, catalog))
+pub fn shared(
+    session: SessionManager,
+    catalog: Arc<dyn ProfileStore>,
+    proxy: Arc<dyn ProxyStatus>,
+) -> Arc<SessionHandler> {
+    Arc::new(SessionHandler::new(session, catalog, proxy))
 }
 
 #[cfg(test)]
@@ -199,12 +220,23 @@ mod tests {
     /// Profile CRUD has its own suite in `session::store`; these tests only need
     /// the catalog to exist, so it points at a directory that is never created.
     fn handler() -> SessionHandler {
+        handler_with(crate::session::proxy::tests::idle_publisher())
+    }
+
+    fn handler_with(proxy: Arc<crate::session::proxy::ProxyPublisher>) -> SessionHandler {
         let pid = std::process::id();
         let root = std::env::temp_dir().join(format!("thisconnect-handler-{pid}"));
         SessionHandler::new(
             crate::session::tests::idle_manager(),
             Arc::new(crate::session::profiles::FileProfileStore::new(root)),
+            proxy as Arc<dyn ProxyStatus>,
         )
+    }
+
+    async fn reply_to(handler: &SessionHandler, request: Request) -> DaemonMessage {
+        handler
+            .dispatch(ClientMessage::Request { id: id(), request })
+            .await
     }
 
     fn id() -> RequestId {
@@ -305,6 +337,59 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn refuses_proxy_details_with_tunnel_not_ready_before_the_listener_is_up() {
+        // Arrange
+        let handler = handler();
+
+        // Act
+        let info = reply_to(&handler, Request::ProxyInfo).await;
+        let stats = reply_to(&handler, Request::ProxyStats).await;
+
+        // Assert
+        for reply in [info, stats] {
+            match reply {
+                DaemonMessage::Error { error, .. } => {
+                    assert_eq!(error.code, ErrorCode::TunnelNotReady)
+                }
+                other => panic!("unexpected reply: {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn answers_with_the_listener_address_and_a_socks5h_url_once_it_is_up() {
+        let handler = handler_with(crate::session::proxy::tests::listening_publisher());
+
+        let reply = reply_to(&handler, Request::ProxyInfo).await;
+
+        match reply {
+            DaemonMessage::Response {
+                response: Response::Proxy { proxy },
+                ..
+            } => {
+                assert_eq!(proxy.listen_addrs.len(), 1);
+                assert!(proxy.socks5h_url.expose().starts_with("socks5h://"));
+            }
+            other => panic!("unexpected reply: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn answers_proxy_statistics_once_the_listener_is_up() {
+        let handler = handler_with(crate::session::proxy::tests::listening_publisher());
+
+        let reply = reply_to(&handler, Request::ProxyStats).await;
+
+        match reply {
+            DaemonMessage::Response {
+                response: Response::ProxyStats { stats },
+                ..
+            } => assert_eq!(stats.local_dns_lookups, 0),
+            other => panic!("unexpected reply: {other:?}"),
+        }
     }
 
     #[test]

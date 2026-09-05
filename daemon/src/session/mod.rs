@@ -15,9 +15,11 @@
 #![allow(dead_code)]
 
 pub mod connect;
+pub mod dns;
 pub mod error;
 pub mod handshake;
 pub mod profiles;
+pub mod proxy;
 pub mod spawn;
 pub mod state;
 pub mod store;
@@ -379,19 +381,31 @@ async fn handle_loss(inner: &Arc<Inner>, reason: &str) {
     });
 }
 
-/// The default dependency set: real openvpn, real sockets, real routing.
+/// The default dependency set: real openvpn, real sockets, real routing, and the
+/// proxy listener attached to the tunnel's lifetime.
+///
+/// The publisher is passed in rather than built here because the IPC handler
+/// answers `ProxyInfo`/`ProxyStats` from the same value. Its DNS capture is wired
+/// into the management transport, which is the only place the tunnel's pushed
+/// resolver can be observed: it arrives in a `>LOG:` line before anything the
+/// orchestrator owns exists (SPEC.md §5.4 D1).
 pub fn system_deps(
     config: &SessionConfig,
     policy: Arc<dyn TunnelPolicyDriver>,
     secrets: Arc<dyn SecretStore>,
     outbound: mpsc::Sender<DaemonMessage>,
+    egress: Arc<proxy::ProxyPublisher>,
 ) -> SessionDeps {
+    let transports = proxy::TappedTransportFactory::new(
+        Arc::new(transport::UnixTransportFactory),
+        egress.capture(),
+    );
     SessionDeps {
         profiles: Arc::new(profiles::FileProfileStore::new(&config.profile_dir)),
         spawner: Arc::new(spawn::SystemSpawner),
-        transports: Arc::new(transport::UnixTransportFactory),
+        transports: Arc::new(transports),
         policy,
-        egress: Arc::new(tunnel::UnwiredPublisher),
+        egress,
         secrets,
         prompts: Arc::new(PromptBroker::new(outbound, config.prompt_timeout)),
     }

@@ -123,10 +123,11 @@ impl<R: CommandRunner> TunnelPolicyDriver for ManagedPolicy<R> {
 
 /// Where the tunnel identity is published for the proxy to pin sockets to.
 ///
-/// The proxy listener is not started here. Whoever owns it implements this over
-/// `thisconnect_proxy::egress::EgressState`: `publish` maps onto `tunnel_up` and
-/// `revoke` onto `tunnel_down`, whose generation bump strands every socket handle
-/// issued against the old tunnel.
+/// [`super::proxy::ProxyPublisher`] is the implementation the daemon installs:
+/// `publish` maps onto `thisconnect_proxy::egress::EgressState::tunnel_up` plus
+/// the tunnel-pinned resolver and the listener, and `revoke` onto `tunnel_down`,
+/// whose generation bump strands every socket handle issued against the old
+/// tunnel.
 pub trait EgressPublisher: Send + Sync {
     fn publish(&self, binding: &TunnelBinding) -> Result<(), PolicyError>;
 
@@ -134,8 +135,10 @@ pub trait EgressPublisher: Send + Sync {
     fn revoke(&self);
 }
 
-/// Used until the proxy worker is wired in. It says so rather than pretending
-/// a tunnel was published.
+/// A publisher that admits it is not one. Kept for tests that need an egress
+/// seam and do not care about the proxy; the daemon installs
+/// [`super::proxy::ProxyPublisher`] instead, because a tunnel that comes up with
+/// nothing able to egress through it must not look like success.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct UnwiredPublisher;
 

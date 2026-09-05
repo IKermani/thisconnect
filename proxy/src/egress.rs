@@ -951,7 +951,13 @@ mod tests {
     async fn pinned_tcp_socket_connects_through_the_named_interface() {
         let state = EgressState::new(policy());
         let egress = loopback_egress(&state);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        // Already-resolved SocketAddr, so no name resolution happens; this is a
+        // test fixture accepting a connection, not a proxy data path.
+        #[allow(clippy::disallowed_methods)]
+        let listener =
+            tokio::net::TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+                .await
+                .unwrap();
         let dst = listener.local_addr().unwrap();
 
         let stream = egress.connect_v4(dst).await.unwrap();
