@@ -335,10 +335,15 @@ impl LinuxPolicy {
     }
 
     /// A failed enumeration is fatal: assuming "nothing is there" would let a stale rule survive
-    /// into a session that believes it built its policy from nothing.
+    /// into a session that believes it built its policy from nothing. The one exception is a table
+    /// the kernel has never created, which is a positive answer — nothing is there — that iproute2
+    /// happens to report as an error.
     fn read(&self, runner: &dyn CommandRunner, command: Command) -> Result<String, PolicyError> {
         let output = runner.run(&command)?;
         if !output.succeeded() {
+            if is_absent_table(&output.stderr) {
+                return Ok(String::new());
+            }
             return Err(PolicyError::CommandFailed {
                 what: "policy state enumeration",
                 command: command.to_string(),
@@ -347,6 +352,14 @@ impl LinuxPolicy {
         }
         Ok(output.stdout)
     }
+}
+
+/// iproute2 is asymmetric here, which is why this is matched on text rather than exit status:
+/// `ip -4 route show table 218` exits 0 with no output when the table does not exist, while
+/// `ip -6 route show table 218` exits 2 with `Error: ipv6: FIB table does not exist.` — observed on
+/// iproute2 6.1.0. Treating that as fatal made startup reconciliation fail on every clean machine.
+fn is_absent_table(stderr: &str) -> bool {
+    stderr.contains("FIB table does not exist")
 }
 
 #[cfg(test)]
@@ -534,6 +547,39 @@ mod tests {
                 "/usr/sbin/ip -4 route flush table 218",
             ]
         );
+    }
+
+    #[test]
+    fn an_absent_table_reads_as_empty_rather_than_as_a_failed_enumeration() {
+        // A clean machine has never had table 218, and `ip -6` reports that as an error.
+        let runner = ScriptedRunner::new(|command| {
+            if command.to_string().contains("route show table") {
+                failed("Error: ipv6: FIB table does not exist.\nDump terminated\n")
+            } else {
+                ok("0:\tfrom all lookup local\n")
+            }
+        });
+
+        let commands = policy()
+            .stale_cleanup(&runner)
+            .expect("clean machine reconciles");
+
+        assert!(commands.is_empty());
+    }
+
+    #[test]
+    fn a_real_enumeration_failure_is_still_fatal() {
+        let runner = ScriptedRunner::new(|command| {
+            if command.to_string().contains("route show table") {
+                failed("Error: Operation not permitted\n")
+            } else {
+                ok("0:\tfrom all lookup local\n")
+            }
+        });
+
+        let outcome = policy().stale_cleanup(&runner);
+
+        assert!(matches!(outcome, Err(PolicyError::CommandFailed { .. })));
     }
 
     #[test]

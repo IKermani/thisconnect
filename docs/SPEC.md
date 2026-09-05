@@ -150,7 +150,7 @@ parse order, last-wins **[V]** (`options.c:7152`):
 --pull-filter ignore "route"
 --pull-filter ignore "redirect-gateway"
 --route-noexec
---dns-updown disable
+--dns-updown disable          # only when the binary accepts it; see below
 --allow-compression no
 --auth-retry interact
 --auth-nocache
@@ -164,9 +164,23 @@ Each of these is load-bearing:
   to fatal error` **[V]**.
 - **`--script-security 1`, not 0.** Level 0 breaks the tunnel: `tun.c:1455` execve's `/sbin/ifconfig`
   for macOS tun bring-up with no `S_SCRIPT` flag **[V]**. Level 1 permits built-ins only.
-- **`--dns-updown disable`.** The *built-in* dns-updown handler runs via `openvpn_execve_check()`
-  **without** `S_SCRIPT` (`dns.c:588-597`) **[V]** — so it executes as root even at script-security 1.
-  Disabling it is a security control, not a preference.
+- **`--dns-updown disable`, when the binary has the option.** The *built-in* dns-updown handler
+  runs via `openvpn_execve_check()` **without** `S_SCRIPT` (`dns.c:588-597`) **[V]** — so it
+  executes as root even at script-security 1. Disabling it is a security control, not a preference.
+
+  The option does not exist before 2.7. openvpn 2.6.19 answers
+  `Options error: Unrecognized option or missing or extra parameter(s) in [CMD-LINE]:1: dns-updown`
+  and exits 1 **before connecting** **[V]** — so passing it unconditionally makes the daemon
+  unable to start on the 2.6 floor this document sets, which is what Ubuntu 24.04 and Debian ship.
+  2.6.19 has the `--dns` family but no dns-updown handler at all: no such string in the binary, no
+  helper under `/usr/libexec/openvpn`, no man entry **[V]**. There is nothing to disable there.
+
+  The daemon therefore probes the resolved binary once per connect, by asking it to parse the
+  option and print its version, and omits the flag only when openvpn names it as unrecognised.
+  This is deliberately **not** a version comparison: a distro that backports `--dns-updown` into a
+  2.6 build still gets the security control, where a version test would silently drop it. Every
+  ambiguous outcome keeps the flag, because the failure that matters is dropping it on a release
+  whose handler runs as root.
 - **`--auth-retry interact`, never `nointeract`.** `nointeract` retries without re-querying
   credentials, replaying an already-consumed TOTP until the account locks **[V]**. `interact` is
   also required for CRV1 dynamic challenge to work at all.
@@ -292,6 +306,13 @@ Mirrored for IPv6 when the tun has a v6 address; otherwise the proxy refuses `AF
   lookup carries the tun IP as source, re-fires the `from <tunip>` rule, and lands in table 218
   **[V]**. Setting `rp_filter=2` is a no-op at best; because the effective value is
   `max(all, iface)` it can only ever *enable* loose RPF on systems that had none.
+- **An absent table is an answer, not an error.** `ip -4 route show table 218` exits 0 with no
+  output when the table does not exist, but `ip -6 route show table 218` exits 2 with
+  `Error: ipv6: FIB table does not exist.` — iproute2 6.1.0 **[V]**. Since state enumeration
+  otherwise treats a non-zero exit as fatal (assuming "nothing is there" would let a stale rule
+  survive), that asymmetry made startup reconciliation fail on every clean machine. That one
+  stderr is matched and read as empty; every other failure stays fatal.
+
 - **Netlink watcher.** Watch `RTM_NEWRULE`, `RTM_DELRULE`, `RTM_DELROUTE`, `RTM_DELADDR` and
   re-assert. NetworkManager, systemd-networkd, and other VPN clients rewrite policy routing;
   Tailscale issue #2325 documents rules being discarded on connectivity changes.
