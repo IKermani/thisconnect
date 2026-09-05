@@ -23,6 +23,7 @@ socket2 = { version = "0.6", features = ["all"] }
 zeroize = { version = "1.9", features = ["derive"] }
 subtle = "2.6"
 base64 = "0.22"
+sha2 = "0.10"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

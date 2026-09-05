@@ -23,6 +23,8 @@ tracing-subscriber = { workspace = true }
 libc = { workspace = true }
 zeroize = { workspace = true }
 base64 = { workspace = true }
+totp-rs = { version = "6", features = ["otpauth", "zeroize"] }
+keyring = { version = "4", features = ["v1"] }
 
 [features]
 # Relaxes IPC peer authentication for local development. MUST be off in release

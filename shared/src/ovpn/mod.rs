@@ -11,11 +11,14 @@ pub mod error;
 pub mod lexer;
 pub mod profile;
 
+pub mod summary;
+
 pub use error::ValidationError;
 pub use profile::{
     ConnectionBlock, DhcpOption, EmittedDirective, InlineMaterial, Profile, Remote, RemoteHost,
     RouteDirective, StaticChallenge, TransportProto,
 };
+pub use summary::{canonical_digest, summarise};
 
 use directive::{classify, Classified, Scope};
 use lexer::{Item, RawBlock};
