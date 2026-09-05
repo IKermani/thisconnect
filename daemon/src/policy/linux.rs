@@ -2,8 +2,9 @@
 
 //! Linux tunnel policy: a source-address rule into a private table (SPEC.md §5.2).
 //!
-//! Exercised on Ubuntu 24.04 / iproute2 6.1.0 by `scripts/verify-egress-linux.sh`. Not yet run on
-//! Debian stable or Fedora.
+//! Exercised on Ubuntu 24.04 / iproute2 6.1.0 by `scripts/verify-egress-linux.sh`, and end to end
+//! against a real server by `scripts/verify-live-tunnel.sh`. The v6 mirror below has still never
+//! run: every live tunnel so far has been v4-only. Not yet run on Debian stable or Fedora.
 //!
 //! Three details are load-bearing and must not be "simplified":
 //!

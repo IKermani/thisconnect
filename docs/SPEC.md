@@ -239,7 +239,9 @@ Contract:
    `ifconfig_ipv6_local`), which is why `--management-up-down` is mandatory. `>UPDOWN` is
    undocumented in `management-notes.txt`, so it is not a stability contract — an integration test
    must assert `dev=` is present on every supported openvpn version, and a missing `dev=` is a hard
-   error, not a warning: §5 egress binding has nothing to bind to without it.
+   error, not a warning: §5 egress binding has nothing to bind to without it. Confirmed on the
+   floor: openvpn 2.6.19 emits the block with a usable `dev=`, captured as `tun0` in a live run
+   **[V]**. The block was the most likely thing to differ between 2.6 and 2.7 and did not.
 7. **Credentials.** Implement all four prompt shapes: plain `Need 'Auth' username/password`;
    `SC:<flag>,<text>` static challenge (SCRV1 base64 for FORMAT=0, plain concat for FORMAT=1);
    CRV1 dynamic challenge parsed from `Verification Failed: '<type>' ['<reason>']`; and
@@ -799,6 +801,20 @@ claim, not a guarantee.
    | F. default route unchanged after teardown | byte-for-byte identical |
    | G. no route residue | no scoped route referencing the utun survived |
 
+   **[V] — ALSO PASSED on Linux.** Same harness, same seven assertions, on Ubuntu 24.04 with
+   openvpn 2.6.19 and iproute2 6.1.0, against a real credentialed profile. `tun0` captured from
+   `>UPDOWN`; C returned the exit address where the direct route returned the ISP's; D counted 0
+   local against 1 tunnelled; E failed closed both immediately (`curl rc=97`) and after 3s
+   (`rc=7`); G confirmed no route referencing `tun0`, no `ip rule` at priority 18000 or 18500, and
+   no table 218 entry survived.
+
+   Reaching that run took four Linux-only defects, none of which any passing unit test showed: the
+   daemon did not build (`totp-rs` and `keyring` were in the macOS-only dependency block while
+   `mod auth` is not cfg-gated); deleting the policy rule leaked to table `main` (§5.2, fixed with
+   the backstop rule); startup reconciliation failed on every clean machine (`ip -6 route show`
+   reports an absent table as an error where `ip -4` reports success); and the management
+   handshake stalled because 2.6.19 answers `version <n>` with silence (§4.3 point 10).
+
    Not covered: IPC peer authentication. The harness must build with `dev-insecure-ipc` because no
    shell script can present the GUI's code signature; §7.3 is covered by its own tests.
 3. **Fail-closed floor and backstop (Linux).** **[V]** With the tun IP **still present**, delete the
@@ -825,7 +841,8 @@ exactly why it cannot stand in for test 3.
 Also required:
 - `PUSH_REPLY` DNS-capture parser against a corpus of real lines from several server types.
 - Management-interface escaping matrix (quotes, backslashes, leading/trailing spaces).
-- `>UPDOWN:ENV` contains `dev=` on every supported openvpn version.
+- `>UPDOWN:ENV` contains `dev=` on every supported openvpn version. Confirmed for 2.6.19 and
+  2.7.6 **[V]**; still an assertion worth keeping for versions beyond those two.
 - Profile-validator corpus: every hard-reject directive, every inline-tag bypass, real-world
   profiles from common providers that must *pass*.
 - CI asserts `dev-insecure-ipc` is off in release artifacts.
@@ -876,8 +893,10 @@ for.** Publish reproducible builds and checksums early so "verify it yourself" i
    verification matches on (`from <ip> lookup 218`, rendered without the `/32`) were all confirmed
    directly. `scripts/verify-live-tunnel.sh` now runs on Linux as well as macOS, and its residue
    check knows about `ip rule` and table 218 rather than assuming the macOS model. Still open: a
-   live-tunnel run against a real server on Linux, which is the only thing that exercises the
-   `>UPDOWN` device capture against openvpn 2.6.19; and a Debian stable and Fedora run.
+   live-tunnel run passed on Ubuntu 24.04 / openvpn 2.6.19 / iproute2 6.1.0 with all seven
+   assertions green, which also settles the `>UPDOWN` device capture on the 2.6 floor. Still open:
+   a Debian stable and Fedora run, and IPv6 — every run so far had a v4-only tunnel, so the v6
+   mirror of §5.2 remains transcribed rather than executed.
 3. Linux distro matrix for §5.2 — every routing, teardown, and RPF claim needs verification on at
    least Debian stable and Fedora. No Linux machine was available during research.
 4. Whether to ship full-tunnel mode in v1.0 after all. It is what most users expect, and the daemon
