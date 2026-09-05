@@ -1815,8 +1815,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64",
+ "core-foundation 0.10.1",
  "keyring",
  "libc",
+ "security-framework",
  "serde",
  "serde_json",
  "thisconnect-shared",
