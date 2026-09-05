@@ -39,6 +39,13 @@ use super::{SessionConfig, SessionDeps, SessionError};
 /// How long openvpn gets to stop politely before it is killed.
 const STOP_GRACE: Duration = Duration::from_secs(5);
 
+/// Ceiling on a whole teardown. Every step inside is individually bounded, but
+/// they talk to subprocesses, a management socket whose peer may already be
+/// gone, and the routing table — so the sum is bounded too. Disconnect is a
+/// user-visible action: an unbounded teardown is a GUI that spins forever with
+/// no way forward, which is worse than a teardown that gives up and says so.
+const TEARDOWN_BUDGET: Duration = Duration::from_secs(30);
+
 /// Everything one attempt owns. Dropping it removes the config, the socket and
 /// their directory, and kills the child.
 pub(crate) struct SessionResources {
@@ -260,7 +267,21 @@ pub(crate) fn exited(exit: Result<ProcessExit, oneshot::error::RecvError>) -> Se
 /// The tunnel identity is revoked first and unconditionally: until it is, the
 /// proxy could still hand out a socket pinned to a tunnel that is already going
 /// away (SPEC.md §5.3).
-pub(crate) async fn teardown(mut resources: SessionResources, deps: &SessionDeps) {
+pub(crate) async fn teardown(resources: SessionResources, deps: &SessionDeps) {
+    if tokio::time::timeout(TEARDOWN_BUDGET, teardown_inner(resources, deps))
+        .await
+        .is_err()
+    {
+        // The tunnel identity was revoked first, so nothing can still be
+        // pinning sockets to it even if a later step is wedged.
+        warn!(
+            "teardown did not finish within {}s; the session is reported as gone anyway",
+            TEARDOWN_BUDGET.as_secs()
+        );
+    }
+}
+
+async fn teardown_inner(mut resources: SessionResources, deps: &SessionDeps) {
     deps.egress.revoke();
 
     if let Some(binding) = resources.binding.take() {
@@ -276,8 +297,16 @@ pub(crate) async fn teardown(mut resources: SessionResources, deps: &SessionDeps
     if let Some(mgmt) = resources.mgmt.take() {
         // Closing the management socket makes openvpn SIGTERM itself; asking
         // first is politer and works even if the child ignores the signal.
-        if let Err(error) = mgmt.client.signal("SIGTERM").await {
-            debug!(%error, "could not ask openvpn to stop over the management channel");
+        // Bounded on its own: the peer may already be gone (the tunnel died, or
+        // something killed openvpn), and politely asking a corpse to exit must
+        // not be what delays a disconnect. Closing the socket below achieves the
+        // same thing regardless.
+        match tokio::time::timeout(STOP_GRACE, mgmt.client.signal("SIGTERM")).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                debug!(%error, "could not ask openvpn to stop over the management channel")
+            }
+            Err(_) => debug!("openvpn did not acknowledge SIGTERM over the management channel"),
         }
         drop(mgmt.client);
         mgmt.task.abort();

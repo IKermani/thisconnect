@@ -546,6 +546,34 @@ async fn disconnect_revokes_the_identity_removes_policy_and_stops_openvpn() {
     assert!(session_dirs(&harness.runtime_dir).is_empty());
 }
 
+/// The kill-switch assertion in scripts/verify-live-tunnel.sh SIGKILLs openvpn
+/// and then asks the daemon to disconnect. Whatever the supervisor has already
+/// done to the session, that request must be answered promptly: a disconnect
+/// that never returns leaves the GUI with a spinner and no way forward.
+#[tokio::test]
+async fn disconnect_answers_promptly_after_openvpn_died_on_its_own() {
+    // Arrange
+    let harness = build("disconnect-after-kill", Options::new());
+    harness.manager.connect(profile()).await.expect("connect");
+
+    // Act: openvpn dies without the daemon asking, as `kill -KILL` does.
+    harness.spawner.process.finish();
+
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        harness.manager.disconnect(),
+    )
+    .await;
+
+    // Assert: any answer is fine — already torn down, or torn down by us. What
+    // is not fine is no answer at all.
+    let answered = outcome.expect("disconnect must answer after an unexpected exit");
+    match answered {
+        Ok(()) | Err(SessionError::NotConnected) | Err(SessionError::Busy) => {}
+        Err(other) => panic!("unexpected disconnect error: {other}"),
+    }
+}
+
 #[tokio::test]
 async fn disconnect_is_refused_when_nothing_is_connected() {
     let harness = build("idle-disconnect", Options::new());

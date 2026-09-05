@@ -975,7 +975,11 @@ teardown_and_assert_clean() {
   step "Disconnecting and checking for residue"
   id="$(ipc_request disconnect)"
   say "asked the daemon to disconnect; waiting up to ${DISCONNECT_TIMEOUT_S}s"
-  ipc_reply_for "$id" "$DISCONNECT_TIMEOUT_S" >/dev/null || warn "no reply to disconnect"
+  if ! ipc_reply_for "$id" "$DISCONNECT_TIMEOUT_S" >/dev/null; then
+    warn "no reply to disconnect within ${DISCONNECT_TIMEOUT_S}s — the daemon log follows, since a
+teardown that never answers is a bug worth naming rather than tolerating"
+    dump_daemon_log
+  fi
   # The kill-switch assertion killed openvpn, so the session may already have
   # torn itself down and reported `failed`. Either terminal state means there is
   # nothing left running, which is what the residue check is about.
