@@ -256,15 +256,26 @@ dns_verdict() {
   echo "pass the daemon counted 0 local DNS lookups against $tunnel names resolved through the tunnel"
 }
 
-# direct_stability_verdict <before> <after> -> "<status> <detail>"
+# direct_stability_verdict <before> <after> <tunnel_exit> -> "<status> <detail>"
+#
+# The property is that the machine's own traffic does NOT enter the tunnel. It is
+# deliberately NOT "the direct IP equals the baseline": plenty of connections
+# rotate their public address on their own (CGNAT, DHCP lease churn, a carrier
+# reassigning), and failing the run for that measures the ISP rather than this
+# client. Equality with the baseline is reported as the strongest result;
+# equality with the TUNNEL exit is the actual failure.
 direct_stability_verdict() {
-  local before="$1" after="$2"
+  local before="$1" after="$2" tunnel_exit="${3:-}"
   if [ -z "$after" ]; then
     echo "fail the machine lost direct connectivity while the tunnel was up — the client is supposed to leave the system alone"
     return 0
   fi
+  if [ -n "$tunnel_exit" ] && [ "$after" = "$tunnel_exit" ]; then
+    echo "fail direct (non-proxied) traffic left from the tunnel exit — the system stack WAS captured"
+    return 0
+  fi
   if [ "$before" != "$after" ]; then
-    echo "fail the direct (non-proxied) public IP changed while connected — the system stack WAS modified"
+    echo "pass direct traffic did not enter the tunnel (its public IP moved on its own, which upstream networks do; it is not the tunnel exit)"
     return 0
   fi
   echo "pass the direct route still exits via the normal interface, unchanged"
@@ -895,7 +906,6 @@ locally and leaks every hostname (SPEC.md §5.4 D8); this harness refuses to use
 assert_egress() {
   local verdict
   step "C. Egress actually traverses the tunnel"
-  PROXY_IP="$(curl_proxied || true)"
   verdict="$(egress_verdict "$DIRECT_IP" "$PROXY_IP")"
   R_EGRESS="${verdict%% *}"
   D_EGRESS="${verdict#* }"
@@ -964,9 +974,18 @@ teardown_and_assert_clean() {
   local id leftovers changed verdict
   step "Disconnecting and checking for residue"
   id="$(ipc_request disconnect)"
+  say "asked the daemon to disconnect; waiting up to ${DISCONNECT_TIMEOUT_S}s"
   ipc_reply_for "$id" "$DISCONNECT_TIMEOUT_S" >/dev/null || warn "no reply to disconnect"
-  ipc_wait "$DISCONNECT_TIMEOUT_S" type=event event.type=state event.state=disconnected >/dev/null ||
-    warn "no disconnected state event; checking the system anyway"
+  # The kill-switch assertion killed openvpn, so the session may already have
+  # torn itself down and reported `failed`. Either terminal state means there is
+  # nothing left running, which is what the residue check is about.
+  if ipc_wait "$DISCONNECT_TIMEOUT_S" type=event event.type=state event.state=disconnected >/dev/null; then
+    say "state: disconnected"
+  elif "$PY" "$JSON_HELPER" find "$IPC_OUT" type=event event.type=state event.state=failed >/dev/null 2>&1; then
+    say "state: failed (expected: the kill-switch assertion killed the tunnel)"
+  else
+    warn "no terminal state event; checking the system anyway"
+  fi
   ipc_close
   stop_daemon
 
@@ -1095,6 +1114,11 @@ Point --echo-url (or THISCONNECT_ECHO_URL) at an endpoint that answers with a ba
   capture_tunnel_device
   fetch_proxy_url
 
+  # Measured before assertion B, which needs to know the tunnel's exit address in
+  # order to tell "the upstream network moved our address" apart from "our own
+  # traffic was captured by the tunnel". Reported under C, where it belongs.
+  PROXY_IP="$(curl_proxied || true)"
+
   step "A. System default route, WHILE the tunnel is up"
   verdict="$(route_verdict "$(default_route_changed)" "while connected")"
   R_ROUTE_DURING="${verdict%% *}"
@@ -1102,7 +1126,7 @@ Point --echo-url (or THISCONNECT_ECHO_URL) at an endpoint that answers with a ba
   say "$R_ROUTE_DURING: $D_ROUTE_DURING"
 
   step "B. The machine's own connectivity, WHILE the tunnel is up"
-  verdict="$(direct_stability_verdict "$DIRECT_IP" "$(curl_direct || true)")"
+  verdict="$(direct_stability_verdict "$DIRECT_IP" "$(curl_direct || true)" "${PROXY_IP:-}")"
   R_DIRECT_STABLE="${verdict%% *}"
   D_DIRECT_STABLE="${verdict#* }"
   say "$R_DIRECT_STABLE: $D_DIRECT_STABLE"
@@ -1261,14 +1285,24 @@ test_direct_stability_fails_when_connectivity_is_lost() {
     "$(direct_stability_verdict "203.0.113.7" "")"
 }
 
-test_direct_stability_fails_when_the_direct_ip_moves() {
-  check_prefix "direct_stability_fails_when_the_direct_ip_moves" "fail the direct" \
-    "$(direct_stability_verdict "203.0.113.7" "198.51.100.4")"
+# A moved public address is NOT a failure on its own: upstream networks rotate
+# addresses (CGNAT, DHCP churn, carrier reassignment), and failing for that
+# measures the ISP rather than this client. What must fail is direct traffic
+# leaving from the tunnel's own exit.
+test_direct_stability_fails_when_direct_traffic_uses_the_tunnel_exit() {
+  check_prefix "direct_stability_fails_when_direct_traffic_uses_the_tunnel_exit" "fail direct" \
+    "$(direct_stability_verdict "203.0.113.7" "192.0.2.9" "192.0.2.9")"
 }
 
 test_direct_stability_passes_when_unchanged() {
   check_prefix "direct_stability_passes_when_unchanged" "pass" \
     "$(direct_stability_verdict "203.0.113.7" "203.0.113.7")"
+  check_eq direct_stability_tolerates_an_upstream_address_change \
+    "pass direct traffic did not enter the tunnel (its public IP moved on its own, which upstream networks do; it is not the tunnel exit)" \
+    "$(direct_stability_verdict "203.0.113.7" "198.51.100.4" "192.0.2.9")"
+  check_eq direct_stability_fails_when_direct_traffic_uses_the_tunnel_exit \
+    "fail direct (non-proxied) traffic left from the tunnel exit — the system stack WAS captured" \
+    "$(direct_stability_verdict "203.0.113.7" "192.0.2.9" "192.0.2.9")"
 }
 
 test_route_verdict_fails_on_any_change() {
@@ -1394,7 +1428,7 @@ run_self_test() {
   test_dns_verdict_passes_only_on_zero
   test_dns_verdict_skips_when_no_name_was_resolved_at_all
   test_direct_stability_fails_when_connectivity_is_lost
-  test_direct_stability_fails_when_the_direct_ip_moves
+  test_direct_stability_fails_when_direct_traffic_uses_the_tunnel_exit
   test_direct_stability_passes_when_unchanged
   test_route_verdict_fails_on_any_change
   test_residue_verdict_fails_on_leftover_routes

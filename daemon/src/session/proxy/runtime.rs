@@ -88,7 +88,7 @@ impl ProxyRuntime for LinkedRuntime {
                 detail: error.to_string(),
             })?;
 
-        let dialer = Arc::new(TunnelDialer::new(egress, resolver));
+        let dialer = Arc::new(TunnelDialer::new(egress, Arc::clone(&resolver)));
         let config = ListenerConfig {
             bind_addrs: self.bind_addrs.clone(),
             ..ListenerConfig::generated(binding.tunnel_has_v6)
@@ -119,7 +119,11 @@ impl ProxyRuntime for LinkedRuntime {
             "proxy listener up"
         );
 
-        Ok(Arc::new(LinkedListener::new(started, self.handle.clone())))
+        Ok(Arc::new(LinkedListener::new(
+            started,
+            self.handle.clone(),
+            resolver,
+        )))
     }
 }
 
@@ -130,13 +134,22 @@ impl ProxyRuntime for LinkedRuntime {
 struct LinkedListener {
     handle: std::sync::Mutex<Option<Handle>>,
     runtime: tokio::runtime::Handle,
+    /// The listener counts sessions and bytes; only the resolver knows how many
+    /// names were answered and — the number that matters — how many were
+    /// answered anywhere other than through the tunnel (SPEC.md §5.4 D7).
+    resolver: Arc<thisconnect_proxy::resolver::TunnelResolver>,
 }
 
 impl LinkedListener {
-    fn new(handle: Handle, runtime: tokio::runtime::Handle) -> Self {
+    fn new(
+        handle: Handle,
+        runtime: tokio::runtime::Handle,
+        resolver: Arc<thisconnect_proxy::resolver::TunnelResolver>,
+    ) -> Self {
         Self {
             handle: std::sync::Mutex::new(Some(handle)),
             runtime,
+            resolver,
         }
     }
 
@@ -156,10 +169,18 @@ impl ProxyListener for LinkedListener {
     }
 
     fn stats(&self) -> ProxySessionStats {
-        self.slot()
+        let mut stats = self
+            .slot()
             .as_ref()
             .map(Handle::stats_snapshot)
-            .unwrap_or_default()
+            .unwrap_or_default();
+        let dns = self.resolver.stats();
+        stats.tunnel_dns_lookups = dns.tunnel_lookups;
+        // Structurally zero: the resolver has no code path to the system
+        // resolver, so this is a claim the type system already makes. Reporting
+        // it is what lets the GUI show it as leak proof rather than a promise.
+        stats.local_dns_lookups = dns.local_lookups;
+        stats
     }
 
     fn shutdown(&self) {
@@ -267,8 +288,15 @@ mod tests {
             .expect("the loopback interface exists on every machine");
         let info = listener.info();
 
-        // Assert: SPEC.md §5.4 D8 — socks5:// resolves locally and leaks, so the
-        // URL handed to the user must be the socks5h form.
+        // Assert: the leak-proof counter is reported, not left at its default.
+        // A resolver that answered names while this read zero would make the
+        // GUI's "0 local DNS lookups" claim meaningless.
+        let stats = listener.stats();
+        assert_eq!(stats.local_dns_lookups, 0);
+        assert_eq!(stats.tunnel_dns_lookups, 0, "nothing resolved yet");
+
+        // SPEC.md §5.4 D8 — socks5:// resolves locally and leaks, so the URL
+        // handed to the user must be the socks5h form.
         assert!(info.socks5h_url.expose().starts_with("socks5h://"));
         assert!(info.is_loopback_only);
         assert!(!info.listen_addrs.is_empty());
