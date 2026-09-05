@@ -291,10 +291,26 @@ route -n add -inet -ifscope <utunN> default -interface <utunN> # p2p / net30
 ```
 
 Scoped routes do not affect the unscoped default lookup — verified: six such routes coexist on the
-dev machine today while the unscoped lookup stays empty **[V]**. **[U]** The `route add -ifscope`
-call itself could not be executed during research (no passwordless sudo). **This is the single
-unverified link in the whole design and must be the first integration test written.** Expected
-result: an outbound socket pinned to the utun flips from `ENETUNREACH` to a working connection.
+dev machine today while the unscoped lookup stays empty **[V]**.
+
+**The whole mechanism is verified end to end for route lookup** by
+`scripts/verify-ifscope-macos.sh`, run under sudo on macOS 26.6 **[V]**. On a synthetic utun90
+(`10.255.255.2 -> 10.255.255.1`):
+
+| Case | Result |
+|---|---|
+| Socket pinned via `IP_BOUND_IF`, **no** scoped route | `ENETUNREACH(51)` — fails closed |
+| Gateway variant scoped route installed | errno 0, connect pending |
+| `-interface` variant scoped route installed | errno 0, connect pending |
+| System default route, at every step and after teardown | byte-for-byte unchanged |
+
+The negative case is the important half: it proves the kernel refuses to fall back to `en0`, which
+is what makes this a race-proof kill switch rather than a routing preference.
+
+`PENDING` is the correct success shape in synthetic mode — nothing answers at `10.255.255.1`, so a
+connect that clears route lookup and then hangs is exactly right; a completed handshake would mean
+traffic went somewhere it should not have. **Still outstanding:** a `--profile` run against a real
+server, to prove end-to-end data flow rather than route lookup alone.
 
 The kernel's refusal to fall back to `en0` is a free, race-proof kill switch. `ENETUNREACH` on bind
 is surfaced in the UI as "tunnel not ready", never as a generic network error.
@@ -718,10 +734,11 @@ make the tray the only path to connect, disconnect, or the challenge prompt.
 Three integration tests define the product's security property. Without them the feature is a
 claim, not a guarantee.
 
-1. **`ifscope` route works (macOS).** **[U]** The one unverified link in the design. On a
-   sudo-capable Mac, install the scoped default route and assert a pinned socket flips from
-   `ENETUNREACH` to a working connection. **Write this first.** If it fails, §5.2's macOS half needs
-   redesign before anything else is built.
+1. **`ifscope` route works (macOS).** **[V] — PASSED**, `scripts/verify-ifscope-macos.sh --confirm`
+   under sudo on macOS 26.6. Pinned socket with no scoped route → `ENETUNREACH(51)`; with either
+   scoped-route variant → errno 0; system default route byte-for-byte unchanged throughout.
+   Synthetic mode proves route lookup. The `--profile` run against a real server, proving
+   end-to-end data flow, is still owed.
 2. **Egress is real.** With the tunnel up and full policy installed, an IP-echo request through the
    proxy returns the exit node's IP, not the ISP's.
 3. **Fail-closed floor.** With the tun IP **still present**, delete the tunnel route from table 218
@@ -779,7 +796,9 @@ for.** Publish reproducible builds and checksums early so "verify it yourself" i
 
 ## 13. Open questions
 
-1. **[U] macOS `route add -ifscope` behaviour.** Test 1 in §10. Everything on macOS depends on it.
+1. **End-to-end data flow through a scoped route.** Route lookup is verified (§10 test 1); a
+   `--profile` run against a real server, asserting an IP-echo returns the exit node's address,
+   is still outstanding.
 2. Linux distro matrix for §5.2 — every routing, teardown, and RPF claim needs verification on at
    least Debian stable and Fedora. No Linux machine was available during research.
 3. Whether to ship full-tunnel mode in v1.0 after all. It is what most users expect, and the daemon
