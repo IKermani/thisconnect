@@ -10,7 +10,7 @@
 use sha2::{Digest, Sha256};
 
 use crate::ipc::{ProfileId, ProfileSummary, RemoteSummary, StaticChallengeSummary, Transport};
-use crate::ovpn::profile::{InlineMaterial, Profile, TransportProto};
+use crate::ovpn::profile::{InlineMaterial, Profile};
 
 /// Hex-encoded SHA-256 of the canonical config body.
 pub fn canonical_digest(canonical: &str) -> String {
@@ -42,10 +42,13 @@ pub fn summarise(
             .map(|remote| RemoteSummary {
                 host: remote.host.to_string(),
                 port: remote.port,
+                // The GUI shows the transport; the family pin stays in the
+                // canonical config where it changes what openvpn dials.
                 transport: match remote.proto {
-                    Some(TransportProto::Tcp) => Transport::Tcp,
+                    Some(proto) if proto.is_tcp() => Transport::Tcp,
+                    Some(_) => Transport::Udp,
                     // openvpn's own default when the profile does not say.
-                    Some(TransportProto::Udp) | None => Transport::Udp,
+                    None => Transport::Udp,
                 },
             })
             .collect(),
