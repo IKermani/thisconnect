@@ -106,13 +106,14 @@ impl ProxyRuntime for StubRuntime {
     }
 }
 
+/// A dual-stack binding must carry a v6 address, not merely a flag: `tunnel_has_v6` is derived
+/// from `ipv6`, and no installed policy can produce one without the other.
 fn binding(tunnel_has_v6: bool) -> TunnelBinding {
     TunnelBinding {
         device: "utun9".to_owned(),
         ipv4: Ipv4Addr::new(10, 8, 0, 2),
-        ipv6: None,
+        ipv6: tunnel_has_v6.then(|| "fd00:abcd::1002".parse().expect("v6 literal")),
         mtu: 1400,
-        tunnel_has_v6,
     }
 }
 

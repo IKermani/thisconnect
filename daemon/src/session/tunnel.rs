@@ -36,10 +36,17 @@ pub struct TunnelBinding {
     pub ipv4: Ipv4Addr,
     pub ipv6: Option<Ipv6Addr>,
     pub mtu: u32,
-    pub tunnel_has_v6: bool,
 }
 
 impl TunnelBinding {
+    /// §5.5. Not a stored flag: a binding that claimed v6 while carrying no v6 address would
+    /// make the proxy offer AAAA and advertise `ATYP=0x04`, then refuse every connection that
+    /// came back — a v4-only tunnel that looks dual-stack from the outside. Deriving it from
+    /// the address makes that state unrepresentable rather than merely unreached.
+    pub fn tunnel_has_v6(&self) -> bool {
+        self.ipv6.is_some()
+    }
+
     fn from_installed(installed: &InstalledPolicy, mtu: u32) -> Result<Self, PolicyError> {
         let ipv4 = match installed.egress_v4() {
             IpAddr::V4(address) => address,
@@ -52,14 +59,19 @@ impl TunnelBinding {
         };
         let ipv6 = match installed.egress_v6() {
             Some(IpAddr::V6(address)) => Some(address),
-            Some(IpAddr::V4(_)) | None => None,
+            None => None,
+            Some(IpAddr::V4(address)) => {
+                return Err(PolicyError::InvalidAddress {
+                    reason: "the tunnel's v6 endpoint is a v4 address",
+                    value: address.to_string(),
+                })
+            }
         };
         Ok(Self {
             device: installed.device().as_str().to_owned(),
             ipv4,
             ipv6,
             mtu,
-            tunnel_has_v6: installed.tunnel_has_v6(),
         })
     }
 }
@@ -184,6 +196,8 @@ pub(crate) mod testing {
 
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+    use crate::policy::TunnelEndpoint;
+
     use super::*;
 
     /// Lets a test hold `install` open, so it can drive the orchestrator into
@@ -293,12 +307,15 @@ pub(crate) mod testing {
                 IpAddr::V4(address) => address,
                 IpAddr::V6(_) => unreachable!("v4 endpoint is v4 by construction"),
             };
+            let ipv6 = match spec.v6().map(TunnelEndpoint::local) {
+                Some(IpAddr::V6(address)) => Some(address),
+                _ => None,
+            };
             Ok(TunnelBinding {
                 device: spec.device().as_str().to_owned(),
                 ipv4,
-                ipv6: None,
+                ipv6,
                 mtu,
-                tunnel_has_v6: spec.v6().is_some(),
             })
         }
 
@@ -366,6 +383,30 @@ mod tests {
         assert_eq!(spec.device().as_str(), "utun4");
         assert_eq!(spec.mtu().as_u32(), 1400);
         assert!(spec.v6().is_none());
+    }
+
+    #[test]
+    fn a_binding_without_a_v6_address_never_claims_v6() {
+        let binding = TunnelBinding {
+            device: "tun0".to_owned(),
+            ipv4: Ipv4Addr::new(10, 8, 0, 2),
+            ipv6: None,
+            mtu: 1400,
+        };
+
+        assert!(!binding.tunnel_has_v6());
+    }
+
+    #[test]
+    fn a_binding_with_a_v6_address_claims_v6() {
+        let binding = TunnelBinding {
+            device: "tun0".to_owned(),
+            ipv4: Ipv4Addr::new(10, 8, 0, 2),
+            ipv6: Some(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 2)),
+            mtu: 1400,
+        };
+
+        assert!(binding.tunnel_has_v6());
     }
 
     #[test]

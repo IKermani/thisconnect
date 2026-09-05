@@ -228,7 +228,7 @@ fn describe_tunnel(
         ipv4: Some(binding.ipv4),
         ipv6: binding.ipv6,
         mtu: Some(binding.mtu),
-        tunnel_has_v6: binding.tunnel_has_v6,
+        tunnel_has_v6: binding.tunnel_has_v6(),
         dns_servers,
         dns_source,
         search_domains: Vec::new(),

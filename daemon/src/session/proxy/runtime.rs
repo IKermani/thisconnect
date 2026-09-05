@@ -77,7 +77,7 @@ impl ProxyRuntime for LinkedRuntime {
             // is, including whether a third-party fallback belongs in it, and
             // appending one here would silently widen that decision.
             fallback: Vec::new(),
-            tunnel_has_v6: binding.tunnel_has_v6,
+            tunnel_has_v6: binding.tunnel_has_v6(),
             ..TunnelDnsConfig::default()
         };
 
@@ -91,7 +91,7 @@ impl ProxyRuntime for LinkedRuntime {
         let dialer = Arc::new(TunnelDialer::new(egress, Arc::clone(&resolver)));
         let config = ListenerConfig {
             bind_addrs: self.bind_addrs.clone(),
-            ..ListenerConfig::generated(binding.tunnel_has_v6)
+            ..ListenerConfig::generated(binding.tunnel_has_v6())
         };
 
         // `publish` is a synchronous trait method called from an async task, so
@@ -237,7 +237,6 @@ mod tests {
                 ipv4: Ipv4Addr::new(10, 255, 255, 2),
                 ipv6: None,
                 mtu: 1400,
-                tunnel_has_v6: false,
             },
             dns: TunnelDnsPlan {
                 nameservers: vec![std::net::IpAddr::V4(Ipv4Addr::new(10, 255, 255, 1))],
