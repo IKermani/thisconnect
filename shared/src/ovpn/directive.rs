@@ -90,7 +90,6 @@ const HARD_REJECT: &[(&str, &str)] = &[
     ("setcon", "changes the security context"),
     ("askpass", "reads a path of the profile's choosing"),
     ("capath", "reads a path of the profile's choosing"),
-    ("setenv", "injects environment into the privileged process"),
     (
         "setenv-safe",
         "injects environment into the privileged process",
@@ -187,6 +186,8 @@ fn reject_dangerous(ctx: Ctx<'_>, name: &str, args: &[String]) -> Result<(), Val
         Some("runs the built-in dns handler as root")
     } else if name == "dev" && args.first().map(String::as_str) == Some("tap") {
         Some("tap devices are not supported")
+    } else if name == "setenv" && !is_inert_setenv(args) {
+        Some("injects environment into the privileged process")
     } else {
         HARD_REJECT
             .iter()
@@ -201,6 +202,40 @@ fn reject_dangerous(ctx: Ctx<'_>, name: &str, args: &[String]) -> Result<(), Val
         }),
         None => Ok(()),
     }
+}
+
+/// `setenv` names that are inert for us, and their permitted values.
+///
+/// Blanket-rejecting `setenv` is right in principle — it seeds the environment
+/// of every process openvpn spawns, and openvpn still execs `/sbin/ifconfig` and
+/// `route` as root at `--script-security 1`, so a `DYLD_INSERT_LIBRARIES` or
+/// `LD_PRELOAD` here is a straight local privilege escalation. But real profiles
+/// from real providers carry `setenv CLIENT_CERT 0`, and rejecting every one of
+/// them makes the validator something users route around.
+///
+/// So: a name allowlist, never a denylist over dangerous names. These are read
+/// by OpenVPN Access Server's own client and are inert for a scriptless one, and
+/// they are dropped rather than emitted (see `classify`), so they never reach a
+/// child process's environment at all.
+const INERT_SETENV: &[(&str, &[&str])] = &[
+    ("CLIENT_CERT", &["0", "1"]),
+    ("GENERIC_CONFIG", &["0", "1"]),
+    ("USERNAME_AS_COMMON_NAME", &["0", "1"]),
+    ("FORWARD_COMPATIBLE", &["0", "1"]),
+    ("ALLOW_PASSWORD_SAVE", &["0", "1"]),
+    ("AUTOLOGIN", &["0", "1"]),
+];
+
+fn is_inert_setenv(args: &[String]) -> bool {
+    let (Some(name), Some(value)) = (args.first(), args.get(1)) else {
+        return false;
+    };
+    if args.len() != 2 {
+        return false;
+    }
+    INERT_SETENV
+        .iter()
+        .any(|(known, values)| known == name && values.contains(&value.as_str()))
 }
 
 type Outcome = Option<Result<Classified, ValidationError>>;
@@ -334,6 +369,10 @@ fn as_keyword(ctx: Ctx<'_>, name: &str, args: &[String]) -> Outcome {
     ];
     match name {
         "dns-updown" => Some(Ok(Classified::Ignored)),
+        // Parsed so a real profile is accepted, then dropped: emitting it would
+        // put the value into the environment of the root ifconfig/route calls
+        // for no benefit, since we run no scripts that would read it.
+        "setenv" => Some(Ok(Classified::Ignored)),
         "proto" => Some(
             args::parse_proto(ctx, args)
                 .map(|p| Classified::Emit(EmittedDirective::new(name, vec![p]))),
@@ -498,6 +537,32 @@ mod tests {
                 classify_top(line).unwrap_err(),
                 ValidationError::ForbiddenDirective { .. }
             ));
+        }
+    }
+
+    #[test]
+    fn accepts_an_inert_setenv_but_drops_it_from_the_canonical_config() {
+        // Arrange / Act / Assert: real provider profiles carry this verbatim.
+        assert_eq!(
+            classify_top("setenv CLIENT_CERT 0"),
+            Ok(Classified::Ignored)
+        );
+    }
+
+    #[test]
+    fn rejects_every_setenv_that_could_reach_the_dynamic_linker() {
+        // Arrange / Act / Assert: openvpn still execs /sbin/ifconfig as root at
+        // script-security 1, so these are a privilege escalation, not a preference.
+        for hostile in [
+            "setenv LD_PRELOAD /tmp/evil.so",
+            "setenv DYLD_INSERT_LIBRARIES /tmp/evil.dylib",
+            "setenv PATH /tmp/bin",
+            "setenv IFS ;",
+            "setenv CLIENT_CERT /tmp/evil",
+            "setenv CLIENT_CERT",
+            "setenv CLIENT_CERT 0 extra",
+        ] {
+            assert!(classify_top(hostile).is_err(), "{hostile} must be refused");
         }
     }
 

@@ -7,4 +7,18 @@
 disallowed-methods = [
     { path = "std::net::ToSocketAddrs::to_socket_addrs", reason = "system resolver: leaks every hostname outside the tunnel. Use the tunnel-pinned resolver." },
     { path = "tokio::net::lookup_host", reason = "system resolver: leaks every hostname outside the tunnel. Use the tunnel-pinned resolver." },
+    # tokio has its OWN sealed ToSocketAddrs whose `&str` / `(&str, u16)` impls call
+    # std::net::ToSocketAddrs on a blocking pool from INSIDE tokio, where the ban above cannot
+    # reach. So the socket constructors that accept it are banned wholesale; the handful of
+    # call sites that pass an already-resolved SocketAddr carry a scoped #[allow] naming this.
+    { path = "tokio::net::TcpStream::connect", reason = "accepts a hostname and resolves it with getaddrinfo. Dial through egress::TunEgress, which takes a SocketAddr." },
+    { path = "tokio::net::TcpListener::bind", reason = "accepts a hostname and resolves it with getaddrinfo. Bind a SocketAddr through listener::bind_tcp." },
+    { path = "tokio::net::UdpSocket::bind", reason = "accepts a hostname and resolves it with getaddrinfo. Build UDP sockets via egress, which uses UdpSocket::from_std." },
+    { path = "tokio::net::UdpSocket::connect", reason = "accepts a hostname and resolves it with getaddrinfo. Connect a SocketAddr obtained from the tunnel-pinned resolver." },
+    { path = "tokio::net::UdpSocket::send_to", reason = "accepts a hostname and resolves it with getaddrinfo. Send to a SocketAddr obtained from the tunnel-pinned resolver." },
+    { path = "std::net::TcpStream::connect", reason = "resolves hostnames with getaddrinfo, outside the tunnel." },
+    { path = "std::net::TcpListener::bind", reason = "resolves hostnames with getaddrinfo, outside the tunnel." },
+    { path = "std::net::UdpSocket::bind", reason = "resolves hostnames with getaddrinfo, outside the tunnel." },
+    { path = "std::net::UdpSocket::connect", reason = "resolves hostnames with getaddrinfo, outside the tunnel." },
+    { path = "std::net::UdpSocket::send_to", reason = "resolves hostnames with getaddrinfo, outside the tunnel." },
 ]

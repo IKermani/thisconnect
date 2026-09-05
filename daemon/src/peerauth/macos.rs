@@ -1,13 +1,45 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! macOS peer authentication: `LOCAL_PEERTOKEN` → audit token → (seam)
-//! `SecCodeCopyGuestWithAttributes` + `SecCodeCheckValidity`.
+//! macOS peer authentication: `LOCAL_PEERTOKEN` → audit token →
+//! `SecCodeCopyGuestWithAttributes` + `SecCodeCheckValidity` against a
+//! compiled-in designated requirement (SPEC.md 7.3).
+
+// Under `dev-insecure-ipc` the parent module selects the uid-only
+// authenticator, so this whole path is compiled but never referenced.
+#![cfg_attr(feature = "dev-insecure-ipc", allow(dead_code))]
+
+mod codesign;
+mod console;
+mod requirement;
 
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::Arc;
 
 use super::{AuthError, PeerAuthenticator, PeerIdentity, PeerPolicy};
 use tokio::net::UnixStream;
+
+// Named honestly for callers and future code, even though only the alias
+// below is constructed today.
+#[allow(unused_imports)]
+pub use self::codesign::{check_audit_token, DesignatedRequirementVerifier};
+
+/// The parent module names the release verifier by its historical placeholder
+/// identifier and cannot be edited from here, so the real verifier answers to
+/// that name too. Nothing about it is unimplemented any more. Under
+/// `dev-insecure-ipc` the parent selects the uid-only authenticator and never
+/// mentions this name.
+#[cfg_attr(feature = "dev-insecure-ipc", allow(unused_imports))]
+pub use self::codesign::DesignatedRequirementVerifier as UnimplementedCodeVerifier;
+
+/// `AuthError` has no variant for a code-signing failure and lives in a module
+/// this one may not extend, so denials are carried on the syscall variant with
+/// the operation that failed. Every construction of it is a refusal.
+fn deny(op: &'static str, detail: impl Into<String>) -> AuthError {
+    AuthError::Syscall {
+        op,
+        source: std::io::Error::other(detail.into()),
+    }
+}
 
 /// `SOL_LOCAL` and `LOCAL_PEERTOKEN` from `<sys/un.h>`; the `libc` crate
 /// exposes neither, so they are pinned here with their header values.
@@ -86,25 +118,6 @@ pub trait CodeVerifier: Send + Sync + 'static {
     fn verify(&self, token: &AuditToken) -> Result<(), AuthError>;
 }
 
-/// The shipping verifier is not implementable without `security-framework`,
-/// which is not in the dependency set, so it denies. This is deliberate: a
-/// permissive placeholder would be a silent local privilege escalation.
-pub struct UnimplementedCodeVerifier;
-
-impl CodeVerifier for UnimplementedCodeVerifier {
-    fn verify(&self, _token: &AuditToken) -> Result<(), AuthError> {
-        // TODO: with `security-framework` 3.7 available, build the requirement
-        // with `FromStr` (`SecRequirement::create_with_string` does not exist):
-        //   let req: SecRequirement = super::GUI_DESIGNATED_REQUIREMENT.parse()?;
-        // then `SecCodeCopyGuestWithAttributes(kSecGuestAttributeAudit = token)`
-        // and `SecCodeCheckValidity(code, kSecCSDefaultFlags, req)`. Treat
-        // errSecCSUnsigned, kPOSIXErrorEPERM and every other non-zero status as
-        // a denial, and resolve the console user via SCDynamicStoreCopyConsoleUser,
-        // denying outright when there is none.
-        Err(AuthError::CodeVerificationUnavailable)
-    }
-}
-
 pub struct AuditTokenAuthenticator {
     policy: PeerPolicy,
     verifier: Arc<dyn CodeVerifier>,
@@ -139,7 +152,7 @@ impl PeerAuthenticator for AuditTokenAuthenticator {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[allow(clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -175,13 +188,24 @@ mod tests {
     }
 
     #[test]
-    fn release_verifier_denies_rather_than_accepting_an_unverified_peer() {
-        let result = UnimplementedCodeVerifier.verify(&token(501, 20, 1));
+    fn the_parent_modules_verifier_name_resolves_to_the_real_release_verifier() {
+        let verifier: Arc<dyn CodeVerifier> = Arc::new(UnimplementedCodeVerifier);
 
-        assert!(matches!(
-            result,
-            Err(AuthError::CodeVerificationUnavailable)
-        ));
+        // A token belonging to no live process must never authenticate.
+        assert!(verifier.verify(&token(501, 20, 1)).is_err());
+    }
+
+    #[test]
+    fn deny_carries_the_failing_operation_so_a_denial_is_diagnosable() {
+        let error = deny("SecCodeCheckValidity", "OSStatus -67050");
+
+        match error {
+            AuthError::Syscall { op, source } => {
+                assert_eq!(op, "SecCodeCheckValidity");
+                assert!(source.to_string().contains("-67050"));
+            }
+            other => panic!("expected a syscall denial, got {other:?}"),
+        }
     }
 
     #[test]

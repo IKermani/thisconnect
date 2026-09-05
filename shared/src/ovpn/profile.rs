@@ -45,17 +45,38 @@ impl fmt::Display for EmittedDirective {
     }
 }
 
+/// Transport plus the address family the profile pinned, if it pinned one.
+///
+/// The family is not cosmetic: `tcp4` forbids openvpn from trying the server's
+/// AAAA record, so collapsing it to `tcp` silently widens what the client will
+/// dial. That is invisible for an IP literal and load-bearing for a hostname.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportProto {
     Udp,
+    Udp4,
+    Udp6,
     Tcp,
+    Tcp4,
+    Tcp6,
+}
+
+impl TransportProto {
+    /// Whether this is TCP, ignoring the family pin. The GUI shows this; the
+    /// canonical config keeps the pin.
+    pub fn is_tcp(self) -> bool {
+        matches!(self, Self::Tcp | Self::Tcp4 | Self::Tcp6)
+    }
 }
 
 impl fmt::Display for TransportProto {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::Udp => "udp",
+            Self::Udp4 => "udp4",
+            Self::Udp6 => "udp6",
             Self::Tcp => "tcp",
+            Self::Tcp4 => "tcp4",
+            Self::Tcp6 => "tcp6",
         })
     }
 }
@@ -303,6 +324,23 @@ mod tests {
         assert_eq!(
             remote.to_directive().to_string(),
             "remote vpn.example.com 1194 udp"
+        );
+    }
+
+    #[test]
+    fn renders_the_address_family_the_profile_pinned() {
+        // Arrange: a real provider profile pinning IPv4.
+        let remote = Remote {
+            host: RemoteHost::Name("vpn.example.com".into()),
+            port: 443,
+            proto: Some(TransportProto::Tcp4),
+        };
+
+        // Act / Assert: collapsing this to `tcp` would let openvpn dial the
+        // server's AAAA record, which the profile explicitly forbade.
+        assert_eq!(
+            remote.to_directive().to_string(),
+            "remote vpn.example.com 443 tcp4"
         );
     }
 

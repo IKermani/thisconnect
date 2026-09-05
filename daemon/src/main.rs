@@ -6,34 +6,62 @@
 //! GUI never runs as root and never touches packets; everything privileged
 //! happens behind the peer-authenticated socket set up here.
 
+mod auth;
+mod handler;
 mod ipc;
-// The supervisor's public surface is re-exported for the tunnel-policy and IPC
-// command modules that are not wired up yet; until they land nothing consumes it.
+// Parts of the management client's surface (byte-count helpers, challenge
+// encoders) are reached only from tests until the GUI drives them.
 #[allow(unused_imports, dead_code)]
 mod mgmt;
 mod peerauth;
+mod policy;
+mod session;
 mod signals;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use tokio::sync::watch;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use ipc::listener::{acquire, ListenerConfig, SocketSource};
-use ipc::{IpcServer, SkeletonHandler};
+use ipc::IpcServer;
 #[cfg(all(not(feature = "dev-insecure-ipc"), target_os = "linux"))]
 use peerauth::lookup_group_id;
 use peerauth::AUTHORISED_GROUP;
 use peerauth::{authenticator, PeerPolicy};
+use policy::{PolicyManager, SystemRunner};
+use session::proxy::runtime::LinkedRuntime;
+use session::proxy::{ProxyPublisher, ProxySettings, ProxyStatus};
+use session::store::ProfileStore;
+use session::tunnel::{ManagedPolicy, TunnelPolicyDriver};
+use session::{system_deps, SessionConfig, SessionManager};
+use thisconnect_proxy::egress::DestinationPolicy;
 
 #[cfg(target_os = "macos")]
 const DEFAULT_SOCKET_PATH: &str = "/var/run/thisconnect.sock";
 #[cfg(not(target_os = "macos"))]
 const DEFAULT_SOCKET_PATH: &str = "/run/thisconnect/thisconnectd.sock";
 
+#[cfg(target_os = "macos")]
+const DEFAULT_RUNTIME_DIR: &str = "/var/run/thisconnect";
+#[cfg(not(target_os = "macos"))]
+const DEFAULT_RUNTIME_DIR: &str = "/run/thisconnect";
+
+#[cfg(target_os = "macos")]
+const DEFAULT_STATE_DIR: &str = "/Library/Application Support/thisconnect";
+#[cfg(not(target_os = "macos"))]
+const DEFAULT_STATE_DIR: &str = "/var/lib/thisconnect";
+
 const SOCKET_PATH_ENV: &str = "THISCONNECT_SOCKET";
+const RUNTIME_DIR_ENV: &str = "THISCONNECT_RUNTIME_DIR";
+const STATE_DIR_ENV: &str = "THISCONNECT_STATE_DIR";
+const OPENVPN_PATH_ENV: &str = "THISCONNECT_OPENVPN";
+/// Bounded: a GUI that stops reading must not be able to grow a root process's
+/// heap. Overflow drops events, never state the fail-closed path depends on.
+const EVENT_CHANNEL: usize = 256;
 const ALLOWED_UIDS_ENV: &str = "THISCONNECT_ALLOWED_UIDS";
 const ALLOWED_GIDS_ENV: &str = "THISCONNECT_ALLOWED_GIDS";
 
@@ -180,15 +208,53 @@ fn platform_default_policy() -> Result<PeerPolicy> {
     ))
 }
 
+/// Reads the daemon's directories out of the environment so a developer can run
+/// it entirely inside a scratch tree.
+fn session_config() -> SessionConfig {
+    let runtime = std::env::var(RUNTIME_DIR_ENV).unwrap_or_else(|_| DEFAULT_RUNTIME_DIR.to_owned());
+    let state = std::env::var(STATE_DIR_ENV).unwrap_or_else(|_| DEFAULT_STATE_DIR.to_owned());
+    let mut config = SessionConfig::new(runtime, state);
+    config.openvpn_path = std::env::var_os(OPENVPN_PATH_ENV).map(PathBuf::from);
+    config
+}
+
 /// `IFF_PERSIST` outlives the process by design, and macOS scoped routes outlive
 /// a dead utun, so a crashed daemon leaks state that the next run collides with.
-async fn reconcile_startup_state() {
-    // TODO: Linux — enumerate tc* devices owned by our uid, tear down leftovers
-    // and their table-218 routes and `from <tunip>` rules, floor route last.
-    // TODO: macOS — drop scoped routes pointing at a dead or recycled utun.
-    // Both need the tunnel-policy module; until it lands, say so rather than
-    // pretending the host is clean.
-    warn!("startup reconciliation is not implemented yet; leftover tun devices and routes from a crashed run are not cleaned up");
+async fn reconcile_startup_state(session: &SessionManager) {
+    match session.reconcile().await {
+        Ok(report) if report.found_nothing() => info!("no leftover tunnel policy found"),
+        Ok(report) => warn!(
+            passes = report.passes,
+            removed = ?report.removed,
+            "removed tunnel policy left behind by an earlier run"
+        ),
+        // A machine we cannot prove clean is one we refuse to install onto later;
+        // connect will fail loudly rather than layering onto stale state.
+        Err(error) => warn!(%error, "startup reconciliation failed"),
+    }
+}
+
+/// The proxy listener, attached to the tunnel lifecycle.
+/// The proxy worker the tunnel publishes to.
+///
+/// `LinkedRuntime` builds the pinned egress, the tunnel-pinned resolver and the
+/// dialer that joins them, then starts the listener. A failure anywhere in that
+/// chain is a refusal, so a tunnel never comes up with nothing able to egress
+/// through it (SPEC.md §3.1 point 5).
+fn proxy_publisher(config: &SessionConfig) -> Arc<ProxyPublisher> {
+    Arc::new(ProxyPublisher::new(
+        Arc::new(LinkedRuntime::new(
+            tokio::runtime::Handle::current(),
+            DestinationPolicy::default(),
+        )),
+        ProxySettings::from_config(config),
+    ))
+}
+
+fn tunnel_policy() -> Result<Arc<dyn TunnelPolicyDriver>> {
+    let manager = PolicyManager::for_platform(SystemRunner)
+        .map_err(|error| anyhow::anyhow!("tunnel policy is unavailable: {error}"))?;
+    Ok(Arc::new(ManagedPolicy::new(manager)))
 }
 
 #[tokio::main]
@@ -212,7 +278,25 @@ async fn main() -> Result<()> {
         );
     }
 
-    reconcile_startup_state().await;
+    let (outbound, inbound) = tokio::sync::mpsc::channel(EVENT_CHANNEL);
+    let config = session_config();
+    let secrets = Arc::new(auth::store::KeyringStore);
+    // Built before `config` is moved into the manager; the catalog and the
+    // connect path must agree on one profile directory.
+    let catalog: Arc<dyn ProfileStore> = Arc::new(session::profiles::FileProfileStore::new(
+        &config.profile_dir,
+    ));
+    let proxy = proxy_publisher(&config);
+    let deps = system_deps(
+        &config,
+        tunnel_policy()?,
+        secrets,
+        outbound.clone(),
+        Arc::clone(&proxy),
+    );
+    let session = SessionManager::new(config, deps, outbound);
+
+    reconcile_startup_state(&session).await;
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     signals::install(shutdown_tx).context("install signal handlers")?;
@@ -223,9 +307,25 @@ async fn main() -> Result<()> {
         auth = authenticator.describe(),
         "IPC server listening"
     );
-    IpcServer::new(listener, authenticator, Arc::new(SkeletonHandler))
-        .run(shutdown_rx)
-        .await;
+    IpcServer::new(
+        listener,
+        authenticator,
+        handler::shared(
+            session.clone(),
+            catalog,
+            Arc::clone(&proxy) as Arc<dyn ProxyStatus>,
+        ),
+        inbound,
+    )
+    .run(shutdown_rx)
+    .await;
+
+    // Shutdown must not leave a tunnel behind: the routes and the utun outlive
+    // this process, and a scoped default route pointing at a dead device is a
+    // correctness and security hazard (SPEC.md 5.2).
+    if let Err(error) = session.disconnect().await {
+        debug!(%error, "nothing to disconnect at shutdown");
+    }
 
     info!("stopped");
     Ok(())

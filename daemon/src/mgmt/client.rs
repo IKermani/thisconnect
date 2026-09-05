@@ -43,6 +43,9 @@ pub struct Connected {
     /// Management interface version announced in the greeting.
     pub version: u32,
     pub task: JoinHandle<Result<(), MgmtError>>,
+    /// Subscribed before the handshake released the hold, so no event emitted
+    /// during or immediately after it can be missed.
+    pub events: broadcast::Receiver<Event>,
 }
 
 #[derive(Clone)]
@@ -77,11 +80,20 @@ impl MgmtClient {
             tunnel: tunnel_rx,
         };
 
+        // Taken BEFORE the handshake, which ends by releasing the hold. openvpn
+        // answers a released hold with `>PASSWORD:` immediately, and a broadcast
+        // send with no receiver is dropped on the floor — so a subscription made
+        // after `connect` returns misses the credential prompt and the connect
+        // stalls in Authenticating forever. Handing this receiver to the caller
+        // is what makes the prompt impossible to miss.
+        let events = client.events.subscribe();
+
         match client.bring_up(event_rx).await {
             Ok(version) => Ok(Connected {
                 client,
                 version,
                 task,
+                events,
             }),
             Err(err) => {
                 task.abort();
@@ -105,7 +117,15 @@ impl MgmtClient {
             format!("version {ANNOUNCED_VERSION}"),
             "state on".to_owned(),
             "bytecount 5".to_owned(),
-            "log on all".to_owned(),
+            // `log on`, never `log on all`. Verified against openvpn 2.7.6: the
+            // `all` form answers SUCCESS *first*, then dumps the log history as
+            // plain data lines, then END. A client that treats SUCCESS as
+            // terminal attributes that history and its END to the NEXT command,
+            // and every reply after it is off by one — the connection then
+            // stalls before the credential prompt is ever handled. We want the
+            // real-time stream, not the history, so `log on` is both correct and
+            // sufficient.
+            "log on".to_owned(),
             "hold release".to_owned(),
         ];
         for command in commands {
@@ -273,7 +293,8 @@ where
                 let (next, lines) = splitter.push(&buf[..count])?;
                 splitter = next;
                 for line in lines {
-                    let (next_acc, routed) = route_line(&line, &accumulator, &mut outbox);
+                    let (next_acc, routed) =
+                        route_line(&line, &accumulator, &mut outbox, pending.is_some());
                     accumulator = next_acc;
                     match routed {
                         Routed::Event(event) => {
@@ -303,10 +324,18 @@ enum Routed {
 }
 
 /// Events are surfaced immediately and never reach the accumulator.
+///
+/// `has_pending` guards against reply desync. The protocol has no correlation
+/// id, so a line arriving while nothing is outstanding — a trailing multiline
+/// body, or an unsolicited SUCCESS — would otherwise seed the accumulator and be
+/// handed to whichever command is sent next. That is exactly how `log on all`
+/// stalled the connect path before the credential prompt: one command's tail
+/// became the next command's reply, and every reply after it was off by one.
 fn route_line(
     line: &str,
     accumulator: &ReplyAccumulator,
     outbox: &mut VecDeque<Command>,
+    has_pending: bool,
 ) -> (ReplyAccumulator, Routed) {
     let frame = classify(line);
     if let Frame::Event(event) = frame {
@@ -318,6 +347,10 @@ fn route_line(
             });
         }
         return (accumulator.clone(), Routed::Event(event));
+    }
+    if !has_pending {
+        // Nothing is waiting for this. Discard rather than accumulate.
+        return (ReplyAccumulator::new(), Routed::Reply(None));
     }
     let (next, reply) = accumulator.accept(&frame);
     (next, Routed::Reply(reply))
@@ -432,10 +465,88 @@ mod tests {
                 "version 6",
                 "state on",
                 "bytecount 5",
-                "log on all",
+                "log on",
                 "hold release"
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn an_event_emitted_while_the_hold_is_released_is_not_lost() {
+        // Arrange: openvpn answers a released hold with `>PASSWORD:` immediately.
+        // A broadcast send with no receiver is dropped, so if `Connected` did not
+        // already hold a subscription the prompt would vanish and the connect
+        // would stall in Authenticating forever.
+        let (client_io, server_io) = tokio::io::duplex(8192);
+        let (mut sent, inject) = spawn_openvpn(server_io, 6);
+        let connecting = tokio::spawn(MgmtClient::connect(client_io));
+
+        // Act: reply to each handshake command, and emit the prompt on the very
+        // same turn as the hold release, before the caller could subscribe.
+        for _ in 0..5 {
+            let line = sent.recv().await.expect("handshake command");
+            inject.send("SUCCESS: ok".to_owned()).expect("inject");
+            if line == "hold release" {
+                inject
+                    .send(">PASSWORD:Need 'Auth' username/password".to_owned())
+                    .expect("inject");
+            }
+        }
+        let mut connected = connecting.await.expect("join").expect("connect");
+
+        // Assert: the greeting is legitimately ahead of it in the same stream.
+        let found = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match connected.events.recv().await {
+                    Ok(Event::Password(_)) => return true,
+                    Ok(_) => continue,
+                    Err(_) => return false,
+                }
+            }
+        })
+        .await
+        .expect("the prompt must not be dropped");
+        assert!(found, "the credential prompt never reached the subscriber");
+    }
+
+    #[tokio::test]
+    async fn the_handshake_never_asks_for_the_log_history() {
+        // Arrange / Act
+        let (_connected, _sent, _inject, handshake) = connect_with(6).await;
+
+        // Assert: verified against openvpn 2.7.6 — `log on all` answers SUCCESS,
+        // then dumps the history as plain data lines, then END. Treating that
+        // SUCCESS as terminal hands the history and its END to the next command
+        // and every reply afterwards is off by one, which stalls the connect
+        // before the credential prompt is ever seen.
+        assert!(
+            !handshake.iter().any(|command| command == "log on all"),
+            "the handshake must not request the log history: {handshake:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_line_arriving_with_no_command_outstanding_is_not_given_to_the_next_one() {
+        // Arrange: a trailing multiline body, as `log on all` produces.
+        let (connected, mut sent, inject, _handshake) = connect_with(6).await;
+        inject
+            .send("stray history line\r\n".to_owned())
+            .expect("inject");
+        inject.send("END\r\n".to_owned()).expect("inject");
+        tokio::task::yield_now().await;
+
+        // Act: the next real command must get its own reply, not the leftovers.
+        let pending = tokio::spawn(async move { connected.client.hold_release().await });
+        let line = sent.recv().await.expect("command");
+        assert_eq!(line, "hold release");
+        inject
+            .send("SUCCESS: hold release succeeded\r\n".to_owned())
+            .expect("inject");
+
+        // Assert
+        let reply = pending.await.expect("join").expect("reply");
+        assert!(reply.lines.is_empty(), "orphan lines leaked into the reply");
+        assert_eq!(reply.text, "hold release succeeded");
     }
 
     #[tokio::test]

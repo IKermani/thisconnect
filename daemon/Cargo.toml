@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 thisconnect-shared = { path = "../shared" }
+thisconnect-proxy = { path = "../proxy" }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 serde = { workspace = true }
@@ -23,6 +24,12 @@ tracing-subscriber = { workspace = true }
 libc = { workspace = true }
 zeroize = { workspace = true }
 base64 = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = { workspace = true }
+core-foundation = { workspace = true }
+totp-rs = { version = "6", features = ["otpauth", "zeroize"] }
+keyring = { version = "4", features = ["v1"] }
 
 [features]
 # Relaxes IPC peer authentication for local development. MUST be off in release

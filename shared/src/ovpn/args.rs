@@ -135,10 +135,14 @@ pub fn parse_host(ctx: Ctx<'_>, arg: &str) -> Result<RemoteHost, ValidationError
 
 fn parse_transport(ctx: Ctx<'_>, arg: &str) -> Result<TransportProto, ValidationError> {
     match arg {
-        "udp" | "udp4" | "udp6" => Ok(TransportProto::Udp),
-        "tcp" | "tcp4" | "tcp6" | "tcp-client" | "tcp4-client" | "tcp6-client" => {
-            Ok(TransportProto::Tcp)
-        }
+        "udp" => Ok(TransportProto::Udp),
+        "udp4" => Ok(TransportProto::Udp4),
+        "udp6" => Ok(TransportProto::Udp6),
+        // The `-client` spellings mean the same thing to a client and are
+        // normalised, since openvpn accepts the short form everywhere.
+        "tcp" | "tcp-client" => Ok(TransportProto::Tcp),
+        "tcp4" | "tcp4-client" => Ok(TransportProto::Tcp4),
+        "tcp6" | "tcp6-client" => Ok(TransportProto::Tcp6),
         other => Err(ctx.invalid(format!("`{other}` is not a supported transport"))),
     }
 }
