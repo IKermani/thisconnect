@@ -55,6 +55,7 @@ DAEMON_BIN="${THISCONNECT_DAEMON_BIN:-}"
 SOCKET_PATH=""
 ID_FILE=""
 ANSWERED_PROMPTS=" "
+REPORTED_STATES=" "
 IPC_OPEN="no"
 
 TUNNEL_DEV=""
@@ -817,8 +818,27 @@ connect_and_authenticate() {
 $line
 EOF_PROMPTS
     fi
+    # Report each new state as it lands. Without this the run is silent for up
+    # to CONNECT_TIMEOUT_S after the password, which reads as a hang.
+    for known in connecting authenticating connected disconnecting failed; do
+      case "$REPORTED_STATES" in
+        *" $known "*) continue ;;
+      esac
+      if "$PY" "$JSON_HELPER" find "$IPC_OUT" type=event event.type=state "event.state=$known" >/dev/null 2>&1; then
+        REPORTED_STATES="$REPORTED_STATES$known "
+        say "state: $known"
+      fi
+    done
+    if "$PY" "$JSON_HELPER" find "$IPC_OUT" type=event event.type=tunnel_up >/dev/null 2>&1; then
+      case "$REPORTED_STATES" in
+        *" tunnel_up "*) : ;;
+        *)
+          REPORTED_STATES="$REPORTED_STATES""tunnel_up "
+          say "tunnel is up; installing routing policy and starting the proxy"
+          ;;
+      esac
+    fi
     if "$PY" "$JSON_HELPER" find "$IPC_OUT" type=event event.type=state event.state=connected >/dev/null 2>&1; then
-      say "state: connected"
       return 0
     fi
     if "$PY" "$JSON_HELPER" find "$IPC_OUT" type=event event.type=state event.state=failed >/dev/null 2>&1; then

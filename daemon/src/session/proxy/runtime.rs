@@ -26,6 +26,9 @@ pub struct LinkedRuntime {
     egress: EgressState,
     resolvers: ResolverState,
     handle: tokio::runtime::Handle,
+    /// Overridable so a machine already using the default port is not simply
+    /// unable to connect, and so tests can take an ephemeral port.
+    bind_addrs: Vec<std::net::SocketAddr>,
 }
 
 impl LinkedRuntime {
@@ -33,10 +36,19 @@ impl LinkedRuntime {
     /// taken explicitly because `start` is called from a blocking teardown-safe
     /// context where `Handle::current` is not guaranteed.
     pub fn new(handle: tokio::runtime::Handle, policy: DestinationPolicy) -> Self {
+        Self::with_bind_addrs(handle, policy, listener::default_bind_addrs())
+    }
+
+    pub fn with_bind_addrs(
+        handle: tokio::runtime::Handle,
+        policy: DestinationPolicy,
+        bind_addrs: Vec<std::net::SocketAddr>,
+    ) -> Self {
         Self {
             egress: EgressState::new(policy),
             resolvers: ResolverState::new(policy),
             handle,
+            bind_addrs,
         }
     }
 }
@@ -77,14 +89,24 @@ impl ProxyRuntime for LinkedRuntime {
             })?;
 
         let dialer = Arc::new(TunnelDialer::new(egress, resolver));
-        let config = ListenerConfig::generated(binding.tunnel_has_v6);
+        let config = ListenerConfig {
+            bind_addrs: self.bind_addrs.clone(),
+            ..ListenerConfig::generated(binding.tunnel_has_v6)
+        };
 
-        // The accept loop needs a reactor, and `start` binds before returning, so
-        // this cannot be spawned and forgotten: a bind failure must surface here.
-        let started = self
-            .handle
-            .block_on(listener::start(config, dialer))
-            .map_err(|error| ProxyError::Listener {
+        // `publish` is a synchronous trait method called from an async task, so
+        // this runs on a runtime worker thread, where a bare `Handle::block_on`
+        // panics with "Cannot start a runtime from within a runtime" — which
+        // would kill the connect immediately after authentication succeeded.
+        // `block_in_place` hands the worker's other tasks to a different thread
+        // first, which makes blocking here legal.
+        //
+        // It has to block rather than spawn: `start` binds the listener before
+        // it returns, and a bind failure must surface as a failed publish rather
+        // than as a tunnel that came up with nothing listening.
+        let started =
+            tokio::task::block_in_place(|| self.handle.block_on(listener::start(config, dialer)))
+                .map_err(|error| ProxyError::Listener {
                 detail: error.to_string(),
             })?;
 
@@ -165,6 +187,11 @@ fn shut_down_info() -> ProxyInfo {
 }
 
 #[cfg(test)]
+pub(crate) mod tests_support {
+    pub(crate) use super::tests::{ephemeral_loopback, request};
+}
+
+#[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -174,7 +201,15 @@ mod tests {
     use std::net::Ipv4Addr;
     use thisconnect_shared::ipc::DnsSource;
 
-    fn request(device: &str) -> ProxyStartRequest {
+    /// Port 0: these tests run concurrently and must not fight over 1080.
+    pub(crate) fn ephemeral_loopback() -> Vec<std::net::SocketAddr> {
+        vec![std::net::SocketAddr::new(
+            std::net::IpAddr::V4(Ipv4Addr::LOCALHOST),
+            0,
+        )]
+    }
+
+    pub(crate) fn request(device: &str) -> ProxyStartRequest {
         ProxyStartRequest {
             binding: TunnelBinding {
                 device: device.to_owned(),
@@ -195,9 +230,10 @@ mod tests {
     async fn refuses_to_start_when_the_tunnel_device_does_not_exist() {
         // Arrange: a device name no machine has, standing in for a tunnel that
         // went away between the management event and this call.
-        let runtime = LinkedRuntime::new(
+        let runtime = LinkedRuntime::with_bind_addrs(
             tokio::runtime::Handle::current(),
             DestinationPolicy::default(),
+            ephemeral_loopback(),
         );
 
         // Act: run off the reactor thread, since start() blocks on it.
@@ -213,9 +249,10 @@ mod tests {
     #[tokio::test]
     async fn a_started_listener_reports_a_socks5h_url_and_shuts_down() {
         // Arrange
-        let runtime = LinkedRuntime::new(
+        let runtime = LinkedRuntime::with_bind_addrs(
             tokio::runtime::Handle::current(),
             DestinationPolicy::default(),
+            ephemeral_loopback(),
         );
         let device = if cfg!(target_os = "macos") {
             "lo0"
@@ -236,6 +273,36 @@ mod tests {
         assert!(info.is_loopback_only);
         assert!(!info.listen_addrs.is_empty());
 
+        listener.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod async_context_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::tests_support::*;
+    use super::*;
+
+    /// `publish` is a synchronous trait method called from an async task, so
+    /// `start` runs on a runtime worker thread. A bare `Handle::block_on` panics
+    /// there, which would take the connect down after authentication.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn starts_from_inside_the_runtime_without_panicking() {
+        let runtime = LinkedRuntime::with_bind_addrs(
+            tokio::runtime::Handle::current(),
+            DestinationPolicy::default(),
+            ephemeral_loopback(),
+        );
+        let device = if cfg!(target_os = "macos") {
+            "lo0"
+        } else {
+            "lo"
+        };
+
+        let listener = runtime
+            .start(&request(device))
+            .expect("start must work on a runtime thread");
         listener.shutdown();
     }
 }
