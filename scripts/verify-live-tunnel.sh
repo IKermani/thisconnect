@@ -908,10 +908,15 @@ EOF_PROMPTS
     if "$PY" "$JSON_HELPER" find "$IPC_OUT" type=event event.type=state event.state=connected >/dev/null 2>&1; then
       return 0
     fi
-    if "$PY" "$JSON_HELPER" find "$IPC_OUT" type=event event.type=state event.state=failed >/dev/null 2>&1; then
+    local failure detail
+    failure="$("$PY" "$JSON_HELPER" find "$IPC_OUT" type=event event.type=state event.state=failed 2>/dev/null || true)"
+    if [ -n "$failure" ]; then
+      # `Event::State` carries the reason; without printing it a failed run says nothing about why.
+      detail="$(printf '%s' "$failure" | json_get event.detail || true)"
+      [ -z "$detail" ] || say "daemon reported: $detail"
       dump_daemon_log
-      die "the daemon reported state=failed. Nothing about the security properties can be
-concluded from a run that never connected."
+      die "the daemon reported state=failed${detail:+ ($detail)}. Nothing about the security
+properties can be concluded from a run that never connected."
     fi
     kill -0 "$DAEMON_PID" 2>/dev/null || {
       dump_daemon_log
