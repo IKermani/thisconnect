@@ -1,0 +1,7 @@
+# Every entry here is a DNS leak or a fail-closed violation. See docs/SPEC.md 5.4 and 9.
+disallowed-methods = [
+    { path = "std::net::ToSocketAddrs::to_socket_addrs", reason = "system resolver: leaks every hostname outside the tunnel. Use the tunnel-pinned resolver." },
+    { path = "tokio::net::lookup_host", reason = "system resolver: leaks every hostname outside the tunnel. Use the tunnel-pinned resolver." },
+    { path = "socket2::Socket::set_freebind_v4", reason = "lets bind() succeed after the tun IP vanishes, destroying fail-closed egress." },
+    { path = "socket2::Socket::set_freebind_v6", reason = "lets bind() succeed after the tun IP vanishes, destroying fail-closed egress." },
+]
