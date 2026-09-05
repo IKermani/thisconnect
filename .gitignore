@@ -1,0 +1,37 @@
+# Rust
+/target/
+**/target/
+*.pdb
+
+# Node / Tauri frontend
+node_modules/
+dist/
+.vite/
+*.tsbuildinfo
+
+# Tauri
+/ui/src-tauri/target/
+/ui/src-tauri/gen/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.swp
+
+# Local secrets and runtime state — never commit
+*.ovpn
+*.pem
+*.key
+*.crt
+*.p12
+!testdata/**/*.ovpn
+/.env
+/.env.*
+!/.env.example
+*.log
+/run/
