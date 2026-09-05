@@ -17,7 +17,9 @@ use super::codec::{classify, CommandReply, Frame, LineSplitter, ReplyAccumulator
 use super::escape::{build_command, check_line_length};
 use super::event::Event;
 use super::tunnel::{self, TunnelState, TunnelTracker};
-use super::{MgmtError, ANNOUNCED_VERSION, COMMAND_TIMEOUT, MIN_MANAGEMENT_VERSION};
+use super::{
+    MgmtError, ANNOUNCED_VERSION, COMMAND_TIMEOUT, MIN_MANAGEMENT_VERSION, REPLY_BEARING_VERSION,
+};
 
 const COMMAND_CHANNEL: usize = 16;
 /// Lossy on purpose: this channel carries bulk `>LOG:` traffic. Nothing that gates the fail-closed
@@ -30,6 +32,11 @@ struct Command {
     line: Zeroizing<String>,
     /// `None` for commands the actor issued itself, such as re-releasing a hold.
     reply: Option<oneshot::Sender<Result<CommandReply, MgmtError>>>,
+    /// False only for a command this openvpn is known to answer with silence. Such a command must
+    /// not occupy the pending slot: the slot is what makes the next reply attributable, and the
+    /// protocol carries no correlation id, so a slot waiting for a reply that never comes both
+    /// stalls for the command timeout and then fails the whole channel.
+    expects_reply: bool,
 }
 
 struct Pending {
@@ -107,14 +114,28 @@ impl MgmtClient {
         if version < MIN_MANAGEMENT_VERSION {
             return Err(MgmtError::UnsupportedVersion { found: version });
         }
-        self.handshake().await?;
+        self.handshake(version).await?;
         Ok(version)
     }
 
     /// Announce a version >= 4 first: `version <n>` for n <= 3 produces no reply at all.
-    async fn handshake(&self) -> Result<(), MgmtError> {
+    ///
+    /// Announce no more than the peer offered. openvpn 2.6.19 greets with version 5 and answers
+    /// `version <n>` with silence for *every* n, so the reply is not awaited below that version —
+    /// verified against 2.6.19, where awaiting it stalled the connect and tore down the channel.
+    /// 2.7.6 answers, and its reply is awaited so it cannot land on the next command instead.
+    async fn handshake(&self, greeted: u32) -> Result<(), MgmtError> {
+        let announced = greeted.min(ANNOUNCED_VERSION);
+        if greeted >= REPLY_BEARING_VERSION {
+            let reply = self.send(format!("version {announced}")).await?;
+            if reply.is_error() {
+                return Err(MgmtError::CommandFailed { text: reply.text });
+            }
+        } else {
+            self.send_unacknowledged(format!("version {announced}"))
+                .await?;
+        }
         let commands = [
-            format!("version {ANNOUNCED_VERSION}"),
             "state on".to_owned(),
             "bytecount 5".to_owned(),
             // `log on`, never `log on all`. Verified against openvpn 2.7.6: the
@@ -159,10 +180,26 @@ impl MgmtClient {
             .send(Command {
                 line,
                 reply: Some(reply_tx),
+                expects_reply: true,
             })
             .await
             .map_err(|_| MgmtError::Closed)?;
         reply_rx.await.map_err(|_| MgmtError::Closed)?
+    }
+
+    /// Queues a command whose reply must not be awaited. See [`Command::expects_reply`].
+    async fn send_unacknowledged(&self, line: impl Into<String>) -> Result<(), MgmtError> {
+        let line = Zeroizing::new(line.into());
+        check_line_length(&line)?;
+
+        self.commands
+            .send(Command {
+                line,
+                reply: None,
+                expects_reply: false,
+            })
+            .await
+            .map_err(|_| MgmtError::Closed)
     }
 
     pub async fn hold_release(&self) -> Result<CommandReply, MgmtError> {
@@ -268,10 +305,12 @@ where
         if pending.is_none() {
             if let Some(command) = outbox.pop_front() {
                 write_line(&mut writer, &command.line).await?;
-                pending = Some(Pending {
-                    reply: command.reply,
-                    deadline: Instant::now() + COMMAND_TIMEOUT,
-                });
+                if command.expects_reply {
+                    pending = Some(Pending {
+                        reply: command.reply,
+                        deadline: Instant::now() + COMMAND_TIMEOUT,
+                    });
+                }
                 continue;
             }
         }
@@ -344,6 +383,7 @@ fn route_line(
             outbox.push_back(Command {
                 line: Zeroizing::new("hold release".to_owned()),
                 reply: None,
+                expects_reply: true,
             });
         }
         return (accumulator.clone(), Routed::Event(event));
@@ -452,6 +492,57 @@ mod tests {
         let handshake = answer_handshake(&mut sent, &inject).await;
         let connected = connecting.await.expect("join").expect("connect");
         (connected, sent, inject, handshake)
+    }
+
+    /// openvpn 2.6.19 greets with version 5 and answers `version <n>` with silence. Replying to
+    /// only the four commands after it is exactly what the real 2.6.19 does, so a handshake that
+    /// completes here is one that completes there.
+    #[tokio::test]
+    async fn handshake_does_not_await_a_reply_openvpn_2_6_never_sends() {
+        let (client_io, server_io) = tokio::io::duplex(8192);
+        let (mut sent, inject) = spawn_openvpn(server_io, 5);
+        let connecting = tokio::spawn(MgmtClient::connect(client_io));
+
+        let announced = sent.recv().await.expect("version command");
+        let mut seen = vec![announced];
+        for _ in 0..4 {
+            let line = sent.recv().await.expect("handshake command");
+            seen.push(line);
+            inject.send("SUCCESS: ok".to_owned()).expect("inject");
+        }
+        let connected = connecting.await.expect("join").expect("connect");
+
+        assert_eq!(connected.version, 5);
+        // Announced down to what the peer offered, never above it.
+        assert_eq!(
+            seen,
+            vec![
+                "version 5",
+                "state on",
+                "bytecount 5",
+                "log on",
+                "hold release"
+            ]
+        );
+    }
+
+    /// The reply-bearing path must keep waiting, or 2.7's answer to `version` lands on `state on`
+    /// and every reply after it is off by one.
+    #[tokio::test]
+    async fn a_version_six_peer_still_has_its_version_reply_awaited() {
+        let (client_io, server_io) = tokio::io::duplex(8192);
+        let (mut sent, _inject) = spawn_openvpn(server_io, 6);
+        let connecting = tokio::spawn(MgmtClient::connect(client_io));
+
+        assert_eq!(sent.recv().await.expect("version"), "version 6");
+        // Nothing further is written until that reply arrives.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(150), sent.recv())
+                .await
+                .is_err(),
+            "the next command was written before the version reply arrived"
+        );
+        connecting.abort();
     }
 
     #[tokio::test]

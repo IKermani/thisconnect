@@ -39,6 +39,10 @@ pub const ANNOUNCED_VERSION: u32 = 6;
 
 /// openvpn 2.6 is the floor; below that the events this daemon depends on are not all present.
 pub const MIN_MANAGEMENT_VERSION: u32 = 5;
+/// The first management version whose `version <n>` command answers. openvpn 2.6.19 (management
+/// version 5) accepts the command and replies to nothing, so awaiting a reply there consumes the
+/// command timeout and then tears down the channel.
+pub const REPLY_BEARING_VERSION: u32 = 6;
 
 #[derive(Debug, thiserror::Error)]
 pub enum MgmtError {

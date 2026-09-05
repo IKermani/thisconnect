@@ -252,6 +252,14 @@ Contract:
    no error **[V]**. Refuse to send any line > 900 bytes; use the multiline base64 password form
    above 256 bytes per parameter.
 10. **Version floor.** Assert management version ≥ 5 (openvpn 2.6) at startup; refuse to run below.
+    Announce no more than the peer greeted with, and **do not await a reply to `version <n>` below
+    management version 6**. openvpn 2.6.19 greets with version 5 and answers `version <n>` with
+    silence for every n **[V]**; 2.7.6 answers **[V]**. Awaiting it on 2.6 consumes the 10s command
+    timeout and then tears the channel down — the connect fails with "the management channel is
+    desynchronised" and never reaches the credential prompt. The reply must still be awaited on 6,
+    or it lands on `state on` and every reply after it is off by one. A command known to go
+    unanswered must not occupy the pending slot at all: that slot is what makes the next reply
+    attributable, and the protocol carries no correlation id.
 
 ### 4.4 Logging
 
