@@ -26,10 +26,18 @@ pub(crate) async fn authenticate(
     profile: &Profile,
     attempt: &Attempt<'_>,
 ) -> Result<TunnelIdentity, SessionError> {
-    let mgmt = resources.mgmt.as_ref().ok_or(SessionError::Internal {
+    let mgmt = resources.mgmt.as_mut().ok_or(SessionError::Internal {
         detail: "no management channel".to_owned(),
     })?;
-    let mut events = mgmt.client.subscribe();
+    // The receiver taken during `MgmtClient::connect`, not a fresh subscription:
+    // the handshake released openvpn's hold, and openvpn answers that with
+    // `>PASSWORD:` immediately. A subscription made here would be created after
+    // that send and would miss it, leaving the connect stuck in Authenticating.
+    // Take it rather than clone it: a tokio broadcast `Receiver` cannot be
+    // rewound, and only the original carries the events buffered since before
+    // the hold was released. The replacement keeps `Connected` well-formed for
+    // anything that subscribes later.
+    let mut events = std::mem::replace(&mut mgmt.events, mgmt.client.subscribe());
     let mut tunnel = mgmt.client.tunnel_state();
     let mut cancel = attempt.cancel.clone();
     let deadline = Instant::now() + attempt.config.connect_timeout;
