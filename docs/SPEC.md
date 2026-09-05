@@ -1,6 +1,7 @@
 # thisconnect — Product Specification
 
-Status: **draft v1**, pre-implementation.
+Status: **v1 in progress**. The macOS half is implemented and verified end to end against a real
+server; the Linux half is implemented and has never executed. See §13.
 License: GPL-3.0-or-later.
 
 Every claim marked **[V]** was empirically verified against `openvpn 2.7.6 aarch64-apple-darwin25.6.0`
@@ -737,14 +738,27 @@ claim, not a guarantee.
 1. **`ifscope` route works (macOS).** **[V] — PASSED**, `scripts/verify-ifscope-macos.sh --confirm`
    under sudo on macOS 26.6. Pinned socket with no scoped route → `ENETUNREACH(51)`; with either
    scoped-route variant → errno 0; system default route byte-for-byte unchanged throughout.
-   Synthetic mode proves route lookup. The `--profile` run against a real server, proving
-   end-to-end data flow, is still owed.
-2. **Egress is real.** With the tunnel up and full policy installed, an IP-echo request through the
-   proxy returns the exit node's IP, not the ISP's.
-3. **Fail-closed floor.** With the tun IP **still present**, delete the tunnel route from table 218
-   and assert `connect()` returns `EHOSTUNREACH` from the floor route. This is the only test that
-   exercises the floor. Separately, delete the `ip rule` and assert failure rather than fall-through
-   to `main`.
+   Synthetic mode proves route lookup; test 2 below proves data flow.
+2. **Egress is real (macOS).** **[V] — PASSED**, `scripts/verify-live-tunnel.sh --confirm` against a
+   commercial OpenVPN server on macOS 26.6, with a real credentialed profile. Seven assertions, all
+   passing:
+
+   | | Result |
+   |---|---|
+   | A. default route unchanged while connected | byte-for-byte identical |
+   | B. direct traffic did not enter the tunnel | exits the normal interface |
+   | C. proxied egress traverses the tunnel | proxy returned the VPN exit's address, direct returned the ISP's |
+   | D. zero local DNS lookups | 0 local against 1 name resolved through the tunnel |
+   | E. fail-closed when the tunnel dies | `kill -KILL` on openvpn, proxy request failed (`curl rc=7`) immediately and after 3s |
+   | F. default route unchanged after teardown | byte-for-byte identical |
+   | G. no route residue | no scoped route referencing the utun survived |
+
+   Not covered: IPC peer authentication. The harness must build with `dev-insecure-ipc` because no
+   shell script can present the GUI's code signature; §7.3 is covered by its own tests.
+3. **Fail-closed floor (Linux).** **[U]** With the tun IP **still present**, delete the tunnel route
+   from table 218 and assert `connect()` returns `EHOSTUNREACH` from the floor route. This is the
+   only test that exercises the floor. Separately, delete the `ip rule` and assert failure rather
+   than fall-through to `main`. `scripts/verify-egress-linux.sh` is written and has never run.
 
 A tun-flap test is worth keeping but must be labelled honestly: it tests `bind()` returning
 `EADDRNOTAVAIL`, **not** the routing policy. It passes with no rule and no floor installed, which is
@@ -796,15 +810,20 @@ for.** Publish reproducible builds and checksums early so "verify it yourself" i
 
 ## 13. Open questions
 
-1. **End-to-end data flow through a scoped route.** Route lookup is verified (§10 test 1); a
-   `--profile` run against a real server, asserting an IP-echo returns the exit node's address,
-   is still outstanding.
-2. Linux distro matrix for §5.2 — every routing, teardown, and RPF claim needs verification on at
+1. **Nothing on macOS.** §10 tests 1 and 2 both passed against a real server; the macOS half of the
+   design is verified rather than argued.
+2. **Everything on Linux.** Not one command in §5.2's Linux half has ever executed: the policy
+   module is transcribed from the spec and covered only by argument-vector tests, and
+   `scripts/verify-egress-linux.sh` has never run. The `ip rule del lookup 218` selector form, the
+   `mtu` argument on `ip route add`, and the exact `ip rule show` substring the verification
+   matches on all need confirming on Debian stable and Fedora. This is now the largest unverified
+   surface in the project.
+3. Linux distro matrix for §5.2 — every routing, teardown, and RPF claim needs verification on at
    least Debian stable and Fedora. No Linux machine was available during research.
-3. Whether to ship full-tunnel mode in v1.0 after all. It is what most users expect, and the daemon
+4. Whether to ship full-tunnel mode in v1.0 after all. It is what most users expect, and the daemon
    already has the privilege to do it.
-4. MTU handling. The observed utun MTU is 1240; tunnels commonly run 1300–1420. TCP relaying lets
+5. MTU handling. The observed utun MTU is 1240; tunnels commonly run 1300–1420. TCP relaying lets
    the kernel handle MSS on the utun path, but IPv6 PMTUD blackholes and oversized v1.1 UDP
    datagrams need a decision.
-5. Whether `allowed_cidrs` should default to the local subnet rather than empty when a user
+6. Whether `allowed_cidrs` should default to the local subnet rather than empty when a user
    explicitly opts into LAN binding.
