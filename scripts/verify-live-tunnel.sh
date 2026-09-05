@@ -793,17 +793,22 @@ answer_prompt() {
   esac
 }
 
+# The daemon does not answer `connect` until the tunnel is up or the attempt has failed, and a
+# profile needing credentials produces a daemon-initiated prompt FIRST. Blocking on the connect
+# reply before servicing prompts is therefore a deadlock: the daemon waits for credentials that
+# the harness will not send until it has a reply it will never get. Everything is watched in one
+# loop instead, and the connect reply is just one of the things that can end it.
 connect_and_authenticate() {
   local id i=0 iters line
   step "Connecting"
   id="$(ipc_request connect "profile_id=$PROFILE_ID")"
-  line="$(ipc_reply_for "$id")" || die "no reply to connect"
-  if [ "$(printf '%s' "$line" | json_get type)" = "error" ]; then
-    dump_daemon_log
-    die "connect was refused: $(printf '%s' "$line" | json_get error.code) — $(printf '%s' "$line" | json_get error.message || true)"
-  fi
   iters=$((CONNECT_TIMEOUT_S * POLLS_PER_S))
   while [ "$i" -lt "$iters" ]; do
+    line="$("$PY" "$JSON_HELPER" find "$IPC_OUT" "id=$id" type=error 2>/dev/null || true)"
+    if [ -n "$line" ]; then
+      dump_daemon_log
+      die "connect was refused: $(printf '%s' "$line" | json_get error.code) — $(printf '%s' "$line" | json_get error.message || true)"
+    fi
     line="$("$PY" "$JSON_HELPER" findall "$IPC_OUT" type=prompt 2>/dev/null || true)"
     if [ -n "$line" ]; then
       while IFS= read -r one; do

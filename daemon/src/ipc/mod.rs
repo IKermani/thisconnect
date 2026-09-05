@@ -6,11 +6,13 @@
 //! a task and before a single byte of it is read, so no unauthenticated peer
 //! ever reaches message dispatch.
 //!
-//! Traffic is bidirectional. Requests are answered in order on the read task,
-//! while credential prompts and state events originate in the daemon and are
-//! pushed without being asked for. Both directions funnel through one writer
-//! task so the socket has a single owner and neither can interleave a partial
-//! line into the other's message.
+//! Traffic is bidirectional. Credential prompts and state events originate in
+//! the daemon and are pushed without being asked for, while requests are
+//! dispatched concurrently rather than one at a time — `connect` cannot answer
+//! until the prompt it raises has been replied to over this same connection, so
+//! serialising them deadlocks. Both directions funnel through one writer task so
+//! the socket has a single owner and neither can interleave a partial line into
+//! the other's message.
 
 pub mod listener;
 
@@ -164,7 +166,7 @@ async fn serve_connection(
     let writer = tokio::spawn(write_loop(write_half, rx));
     let pump = tokio::spawn(pump_outbound(Arc::clone(&outbound), tx.clone()));
 
-    let result = read_loop(read_half, &peer, handler.as_ref(), &tx, &mut shutdown).await;
+    let result = read_loop(read_half, &peer, &handler, &tx, &mut shutdown).await;
 
     // Dropping every sender ends the writer; aborting the pump releases the
     // lease so the next connection can take it.
@@ -188,7 +190,7 @@ async fn pump_outbound(outbound: OutboundLease, tx: mpsc::Sender<DaemonMessage>)
 async fn read_loop(
     read_half: tokio::net::unix::OwnedReadHalf,
     peer: &PeerIdentity,
-    handler: &dyn MessageHandler,
+    handler_arc: &Arc<dyn MessageHandler>,
     tx: &mpsc::Sender<DaemonMessage>,
     shutdown: &mut watch::Receiver<bool>,
 ) -> std::io::Result<()> {
@@ -229,10 +231,19 @@ async fn read_loop(
         };
 
         debug!(uid = peer.uid, "dispatching client message");
-        let reply = handler.dispatch(message).await;
-        if tx.send(reply).await.is_err() {
-            return Ok(());
-        }
+        // Dispatched on its own task, never awaited inline. `connect` does not
+        // answer until the tunnel is up or the attempt failed, and getting there
+        // requires the credential prompt to be answered — over this same
+        // connection. Awaiting the reply here means the prompt reply is never
+        // read, so connect waits for credentials that can never arrive. Replies
+        // carry the request id and the writer task serialises them, so answering
+        // out of order is well-defined.
+        let handler = Arc::clone(handler_arc);
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let reply = handler.dispatch(message).await;
+            let _ = tx.send(reply).await;
+        });
     }
 }
 
@@ -491,6 +502,99 @@ mod tests {
             serde_json::from_str::<DaemonMessage>(&line).expect("each line decodes whole");
         }
         let _ = h.shutdown.send(true);
+    }
+
+    /// Answers the first request only after a second one has been seen, which is
+    /// the shape of `connect`: it cannot finish until the prompt it raises is
+    /// replied to over the same connection.
+    struct BlockingHandler {
+        release: tokio::sync::Notify,
+    }
+
+    impl MessageHandler for BlockingHandler {
+        fn dispatch<'a>(
+            &'a self,
+            message: ClientMessage,
+        ) -> Pin<Box<dyn Future<Output = DaemonMessage> + Send + 'a>> {
+            Box::pin(async move {
+                match message {
+                    ClientMessage::Request { id, .. } => {
+                        self.release.notified().await;
+                        DaemonMessage::Response {
+                            id,
+                            response: Response::Ack,
+                        }
+                    }
+                    ClientMessage::PromptReply { id, .. } => {
+                        self.release.notify_waiters();
+                        DaemonMessage::Response {
+                            id,
+                            response: Response::Ack,
+                        }
+                    }
+                    ClientMessage::Hello { id, .. } => DaemonMessage::Hello {
+                        id,
+                        protocol_version: PROTOCOL_VERSION,
+                        daemon_version: "test".to_owned(),
+                    },
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_long_running_request_does_not_block_the_reply_that_unblocks_it() {
+        // Arrange
+        let path = socket_path("nodeadlock");
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).expect("bind");
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let (_outbound, outbound_rx) = mpsc::channel(16);
+        let handler = Arc::new(BlockingHandler {
+            release: tokio::sync::Notify::new(),
+        });
+        tokio::spawn(
+            IpcServer::new(listener, Arc::new(AllowAll), handler, outbound_rx).run(shutdown_rx),
+        );
+
+        let stream = connect(&path).await.expect("connect");
+        let (r, mut w) = stream.into_split();
+        let mut lines = TokioBufReader::new(r).lines();
+
+        // Act: the request cannot complete until the prompt reply is read, so a
+        // read loop that awaits each dispatch inline never gets there.
+        let req = serde_json::to_string(&ClientMessage::Request {
+            id: RequestId("slow".to_owned()),
+            request: Request::Status,
+        })
+        .expect("encode");
+        w.write_all(format!("{req}\n").as_bytes())
+            .await
+            .expect("write");
+        let reply = serde_json::to_string(&ClientMessage::PromptReply {
+            id: RequestId("unblock".to_owned()),
+            prompt_id: thisconnect_shared::ipc::PromptId("p".to_owned()),
+            reply: thisconnect_shared::ipc::PromptReply::Cancel,
+        })
+        .expect("encode");
+        w.write_all(format!("{reply}\n").as_bytes())
+            .await
+            .expect("write");
+
+        // Assert: both answers arrive.
+        let mut seen = 0;
+        while seen < 2 {
+            let line = tokio::time::timeout(Duration::from_secs(5), lines.next_line())
+                .await
+                .expect("the second request must be read while the first is pending")
+                .expect("read")
+                .expect("a line");
+            serde_json::from_str::<DaemonMessage>(&line).expect("decode");
+            seen += 1;
+        }
+
+        let _ = shutdown.send(true);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]
