@@ -845,8 +845,10 @@ for.** Publish reproducible builds and checksums early so "verify it yourself" i
    passed under `sudo` on Ubuntu 24.04 / iproute2 6.1.0, and the `ip rule del lookup 218` selector
    form, the `mtu` argument on `ip route add`, and the exact `ip rule show` substring the
    verification matches on (`from <ip> lookup 218`, rendered without the `/32`) were all confirmed
-   directly. Still open: a Debian stable and Fedora run, and a live-tunnel run against a real
-   server — `scripts/verify-live-tunnel.sh` is still macOS-only.
+   directly. `scripts/verify-live-tunnel.sh` now runs on Linux as well as macOS, and its residue
+   check knows about `ip rule` and table 218 rather than assuming the macOS model. Still open: a
+   live-tunnel run against a real server on Linux, which is the only thing that exercises the
+   `>UPDOWN` device capture against openvpn 2.6.19; and a Debian stable and Fedora run.
 3. Linux distro matrix for §5.2 — every routing, teardown, and RPF claim needs verification on at
    least Debian stable and Fedora. No Linux machine was available during research.
 4. Whether to ship full-tunnel mode in v1.0 after all. It is what most users expect, and the daemon

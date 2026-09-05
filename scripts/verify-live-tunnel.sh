@@ -38,6 +38,12 @@ readonly EXIT_PASS=0
 readonly EXIT_FAIL=1
 readonly EXIT_SKIP=2
 
+PLATFORM="$(uname -s)"
+# §5.2 Linux policy objects, which must be gone after teardown. macOS installs neither.
+readonly POLICY_TABLE="218"
+readonly RULE_PRIORITY="18000"
+readonly BACKSTOP_PRIORITY="18500"
+
 PROFILE=""
 PROFILE_NAME="live-harness"
 ECHO_URL="${THISCONNECT_ECHO_URL:-$DEFAULT_ECHO_URL}"
@@ -185,8 +191,15 @@ is_ip_literal() {
   return 1
 }
 
-is_valid_utun_name() {
-  [[ "$1" =~ ^utun[0-9]{1,3}$ ]]
+# The daemon names the device; this only rejects a name too implausible to search the routing
+# table for. Taking the platform as an argument is what lets the self-test cover both.
+is_valid_tunnel_device() {
+  local name="$1" platform="${2:-$PLATFORM}"
+  case "$platform" in
+    Darwin) [[ "$name" =~ ^utun[0-9]{1,3}$ ]] ;;
+    Linux) [[ "$name" =~ ^(tun|tap)[0-9]{1,3}$ ]] ;;
+    *) return 1 ;;
+  esac
 }
 
 # stdin: `ps -axo pid=,ppid=,comm=` output. $1: the daemon pid. Prints its openvpn child.
@@ -194,7 +207,23 @@ pick_openvpn_child() {
   awk -v parent="$1" '$2 == parent && $3 ~ /openvpn/ { print $1; exit }'
 }
 
-# stdin: `netstat -rn` output. Prints every line still referencing the device.
+# The whole routing state the residue check searches.
+route_table_dump() {
+  case "$PLATFORM" in
+    Darwin) netstat -rn 2>/dev/null || true ;;
+    Linux) ip route show table all 2>/dev/null || true ;;
+  esac
+}
+
+# Leftover §5.2 policy objects. macOS installs no rules and no private table, so this is empty
+# there by construction; on Linux it is the only thing that would catch a surviving backstop.
+policy_residue() {
+  [ "$PLATFORM" = "Linux" ] || return 0
+  ip rule show 2>/dev/null | grep -E "^(${RULE_PRIORITY}|${BACKSTOP_PRIORITY}):" || true
+  ip route show table "$POLICY_TABLE" 2>/dev/null | sed "s/^/table ${POLICY_TABLE}: /" || true
+}
+
+# stdin: `route_table_dump` output. Prints every line still referencing the device.
 routes_mentioning_device() {
   local dev="$1"
   [ -n "$dev" ] || return 0
@@ -293,12 +322,20 @@ route_verdict() {
 
 # residue_verdict <leftover-lines> <device> -> "<status> <detail>"
 residue_verdict() {
-  local leftovers="$1" dev="$2"
-  if [ -z "$leftovers" ]; then
-    echo "pass no route referencing $dev survived teardown (macOS has no ip rules; a scoped route is the only residue possible)"
+  local leftovers="$1" dev="$2" policy="${3:-}" platform="${4:-$PLATFORM}"
+  if [ -n "$leftovers" ]; then
+    echo "fail routes referencing $dev survived teardown — a default route pointing at a dead tunnel device is a correctness and security hazard (SPEC.md §5.2)"
     return 0
   fi
-  echo "fail routes referencing $dev survived teardown — a scoped default route pointing at a dead utun is a correctness and security hazard (SPEC.md §5.2)"
+  if [ -n "$policy" ]; then
+    echo "fail §5.2 policy state survived teardown: $(printf '%s' "$policy" | tr '\n' ';') — a leftover rule or table ${POLICY_TABLE} entry keeps the tun source address routable after the tunnel is gone"
+    return 0
+  fi
+  if [ "$platform" = "Linux" ]; then
+    echo "pass no route referencing $dev, no ip rule at priority $RULE_PRIORITY or $BACKSTOP_PRIORITY, and no table $POLICY_TABLE entry survived teardown"
+    return 0
+  fi
+  echo "pass no route referencing $dev survived teardown (macOS has no ip rules; a scoped route is the only residue possible)"
 }
 
 # overall_verdict <status>... -> "PASS" | "PASS-WITH-GAPS" | "FAIL"
@@ -585,7 +622,15 @@ resolve_cargo() {
   local candidate
   candidate="$(command -v cargo || true)"
   if [ -z "$candidate" ] && [ -n "${SUDO_USER:-}" ]; then
-    candidate="/Users/${SUDO_USER}/.cargo/bin/cargo"
+    local home
+    home="$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6)"
+    if [ -z "$home" ]; then
+      case "$PLATFORM" in
+        Darwin) home="/Users/${SUDO_USER}" ;;
+        *) home="/home/${SUDO_USER}" ;;
+      esac
+    fi
+    candidate="$home/.cargo/bin/cargo"
     [ -x "$candidate" ] || candidate=""
   fi
   printf '%s' "$candidate"
@@ -682,7 +727,14 @@ cleanup() {
 # Measurements
 # ---------------------------------------------------------------------------
 
-snapshot_default_route() { route -n get -inet default 2>&1 || true; }
+# Deliberately the main-table default only. On Linux the policy adds `ip rule` entries by design,
+# so folding rules in here would make assertion A fail on a correct run.
+snapshot_default_route() {
+  case "$PLATFORM" in
+    Darwin) route -n get -inet default 2>&1 || true ;;
+    Linux) ip -4 route show default 2>&1 || true ;;
+  esac
+}
 
 # Prints "no" when the route is byte-for-byte identical, "yes" otherwise, and shows the diff.
 default_route_changed() {
@@ -714,13 +766,17 @@ curl_proxied() {
 # ---------------------------------------------------------------------------
 
 preflight() {
-  [ "$(uname -s)" = "Darwin" ] || die "this harness is macOS-only; the Linux half is verify-egress-linux.sh"
+  case "$PLATFORM" in
+    Darwin | Linux) ;;
+    *) die "this harness supports macOS and Linux; this is $PLATFORM" ;;
+  esac
   [ "$(id -u)" -eq 0 ] || die "must run as root (sudo $0 --profile <path> --confirm)"
   [ -n "$PROFILE" ] || die "--profile is required"
   [ -r "$PROFILE" ] || die "profile not readable: $PROFILE"
   PY="$(command -v python3 || true)"
-  [ -n "$PY" ] || die "python3 is required for JSON framing (install the Xcode command line tools)"
+  [ -n "$PY" ] || die "python3 is required for JSON framing"
   command -v nc >/dev/null || die "nc is required to speak to the unix socket"
+  [ "$PLATFORM" != "Linux" ] || command -v ip >/dev/null || die "iproute2 is required"
   command -v curl >/dev/null || die "curl is required"
   OPENVPN_BIN="$(command -v openvpn || true)"
   [ -n "$OPENVPN_BIN" ] || die "openvpn not found in PATH"
@@ -875,7 +931,7 @@ capture_tunnel_device() {
     return 0
   }
   dev="$(printf '%s' "$line" | json_get event.tunnel.device || true)"
-  if is_valid_utun_name "$dev"; then
+  if is_valid_tunnel_device "$dev"; then
     TUNNEL_DEV="$dev"
     say "tunnel device: $TUNNEL_DEV"
   else
@@ -999,15 +1055,22 @@ teardown that never answers is a bug worth naming rather than tolerating"
   D_ROUTE_AFTER="${verdict#* }"
   say "$R_ROUTE_AFTER: $D_ROUTE_AFTER"
 
-  if [ -z "$TUNNEL_DEV" ]; then
+  local policy
+  policy="$(policy_residue)"
+  if [ -z "$TUNNEL_DEV" ] && [ -z "$policy" ]; then
     R_RESIDUE="skip"
-    D_RESIDUE="no tunnel device was captured, so leftover scoped routes could not be checked"
+    D_RESIDUE="no tunnel device was captured, so leftover routes could not be checked"
   else
-    leftovers="$(netstat -rn 2>/dev/null | routes_mentioning_device "$TUNNEL_DEV" || true)"
-    verdict="$(residue_verdict "$leftovers" "$TUNNEL_DEV")"
+    # A leftover rule or table entry is a failure whether or not the device name was captured,
+    # so this branch is taken on policy residue alone.
+    leftovers=""
+    [ -z "$TUNNEL_DEV" ] ||
+      leftovers="$(route_table_dump | routes_mentioning_device "$TUNNEL_DEV" || true)"
+    verdict="$(residue_verdict "$leftovers" "${TUNNEL_DEV:-<uncaptured>}" "$policy")"
     R_RESIDUE="${verdict%% *}"
     D_RESIDUE="${verdict#* }"
     [ -z "$leftovers" ] || printf '%s\n' "$leftovers"
+    [ -z "$policy" ] || printf '%s\n' "$policy"
   fi
   say "$R_RESIDUE: $D_RESIDUE"
 }
@@ -1026,7 +1089,8 @@ This run will, as root:
       C. the public IP seen through the proxy over socks5h://, which must DIFFER from B
       D. the daemon's DNS counters: 0 local lookups against a non-zero tunnel count
       E. kill -KILL the daemon's openvpn child and assert a proxy request FAILS
-  - disconnect, stop the daemon, and re-check the default route and for leftover routes
+  - disconnect, stop the daemon, and re-check the default route, leftover routes, and (on Linux)
+    any surviving ip rule at priority $RULE_PRIORITY or $BACKSTOP_PRIORITY or entry in table $POLICY_TABLE
 
 It sends two HTTPS requests per measurement to $ECHO_URL, one direct and one through the proxy.
 It changes no route, no interface and no resolver of its own.
@@ -1177,14 +1241,16 @@ check_prefix() {
 }
 
 check_accepts() {
-  local name="$1" fn="$2" value="$3" rc=0
-  "$fn" "$value" || rc=$?
+  local name="$1" fn="$2" rc=0
+  shift 2
+  "$fn" "$@" || rc=$?
   check_eq "$name" "0" "$rc"
 }
 
 check_rejects() {
-  local name="$1" fn="$2" value="$3" rc=0
-  "$fn" "$value" || rc=$?
+  local name="$1" fn="$2" rc=0
+  shift 2
+  "$fn" "$@" || rc=$?
   check_eq "$name" "1" "$rc"
 }
 
@@ -1316,8 +1382,37 @@ test_route_verdict_fails_on_any_change() {
 
 test_residue_verdict_fails_on_leftover_routes() {
   check_prefix "residue_verdict_fails_on_leftover_routes" "fail" \
-    "$(residue_verdict "default 10.8.0.1 utun7" utun7)"
-  check_prefix "residue_verdict_passes_when_clean" "pass" "$(residue_verdict "" utun7)"
+    "$(residue_verdict "default 10.8.0.1 utun7" utun7 "" "Darwin")"
+  check_prefix "residue_verdict_passes_when_clean" "pass" \
+    "$(residue_verdict "" utun7 "" "Darwin")"
+}
+
+test_residue_verdict_fails_on_a_surviving_policy_rule() {
+  check_prefix "residue_verdict_fails_on_a_surviving_backstop" "fail §5.2 policy state" \
+    "$(residue_verdict "" tun0 "18500:	from 10.8.0.2 unreachable" "Linux")"
+  check_prefix "residue_verdict_fails_on_a_surviving_table_entry" "fail §5.2 policy state" \
+    "$(residue_verdict "" tun0 "table 218: unreachable default metric 4000" "Linux")"
+  check_prefix "residue_verdict_passes_when_no_policy_survived" "pass" \
+    "$(residue_verdict "" tun0 "" "Linux")"
+}
+
+test_residue_verdict_reports_a_leftover_route_before_policy_state() {
+  check_prefix "residue_verdict_reports_a_leftover_route_first" "fail routes referencing" \
+    "$(residue_verdict "default dev tun0" tun0 "18000:	from 10.8.0.2 lookup 218" "Linux")"
+}
+
+test_spots_a_leftover_linux_route() {
+  local sample result
+  sample=$'default via 192.168.1.99 dev wlp11s0 proto dhcp metric 600\ndefault dev tun0 scope link'
+  result="$(printf '%s\n' "$sample" | routes_mentioning_device tun0 | wc -l | tr -d ' ')"
+  check_eq "spots_a_leftover_linux_route" "1" "$result"
+}
+
+test_does_not_confuse_tun0_with_tun01() {
+  local sample result
+  sample=$'default dev tun01 scope link'
+  result="$(printf '%s\n' "$sample" | routes_mentioning_device tun0)"
+  check_eq "does_not_confuse_tun0_with_tun01" "" "$result"
 }
 
 test_overall_verdict_is_dominated_by_a_single_failure() {
@@ -1361,10 +1456,15 @@ test_killswitch_is_skipped_when_egress_never_worked() {
     "the proxy was never observed working" "$D_KILLSWITCH"
 }
 
-test_utun_name_validation() {
-  check_accepts "accepts_plain_utun_name" is_valid_utun_name "utun7"
-  check_rejects "rejects_utun_name_with_metacharacters" is_valid_utun_name 'utun7;id'
-  check_rejects "rejects_non_utun_device" is_valid_utun_name "en0"
+test_tunnel_device_validation() {
+  check_accepts "accepts_plain_utun_name" is_valid_tunnel_device "utun7" "Darwin"
+  check_rejects "rejects_utun_name_with_metacharacters" is_valid_tunnel_device 'utun7;id' "Darwin"
+  check_rejects "rejects_non_utun_device" is_valid_tunnel_device "en0" "Darwin"
+  check_accepts "accepts_linux_tun_name" is_valid_tunnel_device "tun0" "Linux"
+  check_accepts "accepts_linux_tap_name" is_valid_tunnel_device "tap3" "Linux"
+  check_rejects "rejects_linux_physical_device" is_valid_tunnel_device "wlp11s0" "Linux"
+  check_rejects "rejects_utun_name_on_linux" is_valid_tunnel_device "utun7" "Linux"
+  check_rejects "rejects_linux_tun_name_with_metacharacters" is_valid_tunnel_device 'tun0;id' "Linux"
 }
 
 # The JSON helper is what keeps secrets off argv and out of the log, so its escaping is tested
@@ -1436,6 +1536,10 @@ run_self_test() {
   test_direct_stability_passes_when_unchanged
   test_route_verdict_fails_on_any_change
   test_residue_verdict_fails_on_leftover_routes
+  test_residue_verdict_fails_on_a_surviving_policy_rule
+  test_residue_verdict_reports_a_leftover_route_before_policy_state
+  test_spots_a_leftover_linux_route
+  test_does_not_confuse_tun0_with_tun01
   test_overall_verdict_is_dominated_by_a_single_failure
   test_overall_verdict_reports_gaps_rather_than_a_clean_pass
   test_overall_verdict_passes_only_when_everything_passed
@@ -1443,7 +1547,7 @@ run_self_test() {
   test_headline_marks_an_unmeasured_property
   test_a_gap_exits_skip_rather_than_pass
   test_killswitch_is_skipped_when_egress_never_worked
-  test_utun_name_validation
+  test_tunnel_device_validation
   test_request_ids_are_unique_across_command_substitutions
   test_json_helper_round_trips_a_password_from_stdin
   say ""
