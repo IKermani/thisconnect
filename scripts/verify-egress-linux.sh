@@ -72,6 +72,7 @@ LIVE_TUN_IP=""
 CONFIRMED="no"
 SELF_TEST="no"
 NETNS="no"
+WATCHER="no"
 
 WORK_DIR=""
 PROBE_BIN=""
@@ -101,6 +102,11 @@ Options:
   --netns              Run inside a private user+network namespace. Needs no root, touches
                        no host networking, and manufactures the escape device that makes the
                        backstop assertion conclusive. Incompatible with --egress-check.
+  --watcher            Prove the netlink watcher re-asserts policy deleted out from under a
+                       live session (SPEC.md §5.2). Builds the daemon's ignored watcher test
+                       and runs it in a private user+network namespace; needs no root. The
+                       test carries its own control and reports INCONCLUSIVE if the namespace
+                       cannot demonstrate the leak. Implies --netns; ignores --family.
   --family v4|v6|both  Which families to exercise (default both).
   --dev NAME           Throwaway tun name (default tc-verify0).
   --tun-ip ADDR        IPv4 address for the throwaway tun (default 10.255.255.2).
@@ -129,6 +135,7 @@ parse_args() {
       --confirm) CONFIRMED="yes" ;;
       --self-test) SELF_TEST="yes" ;;
       --netns) NETNS="yes" ;;
+      --watcher) WATCHER="yes" ;;
       --family)
         require_value "$@"
         FAMILIES="$(parse_family "$2")" || die "unknown family: $2 (want v4, v6 or both)"
@@ -666,6 +673,35 @@ run_egress_test() {
   EGRESS_VERDICT="$(evaluate_egress_verdict "$direct" "$tunnel")"
 }
 
+# The watcher lives in the daemon, so this mode delegates to the daemon's own ignored test
+# rather than re-implementing re-assertion in shell. The build happens OUTSIDE the namespace so
+# a compile error is reported as a compile error, not as a namespace failure.
+run_watcher_test() {
+  step "Test: the netlink watcher re-asserts policy deleted mid-session"
+  command -v cargo >/dev/null || die "--watcher needs cargo"
+  command -v unshare >/dev/null || die "--watcher needs util-linux's unshare(1)"
+  say "Building the daemon test binary (outside the namespace)"
+  cargo test -p thisconnect-daemon --bin thisconnectd --no-run ||
+    die "the daemon test binary does not build"
+  say "Running the watcher test inside a private user+network namespace"
+  local output rc=0
+  output="$(unshare --user --map-root-user --net -- \
+    cargo test -p thisconnect-daemon --bin thisconnectd -- \
+    --ignored --nocapture --test-threads=1 the_watcher_restores 2>&1)" || rc=$?
+  printf '%s\n' "$output"
+  # A filter matching nothing exits 0 on some cargo versions, which would report PASS having
+  # run nothing. "0 passed" alone does not distinguish that from a genuine pass, so also demand
+  # the filtered test actually ran.
+  if [ "$rc" -eq 0 ] && printf '%s\n' "$output" | grep -q "test result: ok" &&
+    printf '%s\n' "$output" | grep -qE "running 1 test|test .*the_watcher_restores.* \.\.\. ok"; then
+    WATCHER_VERDICT="PASS the watcher restored both rules and the lookup stayed on the tun"
+  elif [ "$rc" -eq 0 ]; then
+    WATCHER_VERDICT="FAIL the run reported success but the watcher test never ran (filter matched nothing); see the output above"
+  else
+    WATCHER_VERDICT="FAIL see the test output above; an INCONCLUSIVE control reports there too"
+  fi
+}
+
 print_plan() {
   local family
   say "This run will, as root${NETNS:+ (inside a private network namespace)}:"
@@ -719,6 +755,7 @@ enter_netns() {
 FLOOR_VERDICTS=()
 RULE_VERDICTS=()
 EGRESS_VERDICT=""
+WATCHER_VERDICT=""
 
 print_verdict() {
   local line all=""
@@ -735,6 +772,10 @@ print_verdict() {
     say "test 2 egress: $EGRESS_VERDICT"
     all="$all$EGRESS_VERDICT"
   fi
+  if [ -n "$WATCHER_VERDICT" ]; then
+    say "netlink watcher: $WATCHER_VERDICT"
+    all="$all$WATCHER_VERDICT"
+  fi
 
   case "$all" in
     *FAIL*)
@@ -743,6 +784,8 @@ print_verdict() {
       say "A floor-route failure means a dropped tunnel route lets sockets escape or return an"
       say "errno the SOCKS5 layer cannot map. A rule failure means the netlink watcher in §5.2"
       say "is load-bearing rather than defence in depth, and teardown order must be re-derived."
+      say "A netlink watcher failure means policy deleted mid-session is not re-asserted, so"
+      say "§5.2's re-assertion latency is unbounded and the Linux leak window is open again."
       return 1
       ;;
     *INCONCLUSIVE*)
@@ -770,6 +813,11 @@ main() {
   fi
   if [ "$NETNS" = "yes" ] && [ -z "${TC_VERIFY_IN_NETNS:-}" ]; then
     enter_netns "$@"
+  fi
+  if [ "$WATCHER" = "yes" ]; then
+    run_watcher_test
+    print_verdict
+    return
   fi
 
   preflight
