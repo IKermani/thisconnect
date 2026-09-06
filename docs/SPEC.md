@@ -876,6 +876,15 @@ A tun-flap test is worth keeping but must be labelled honestly: it tests `bind()
 `EADDRNOTAVAIL`, **not** the routing policy. It passes with no rule and no floor installed, which is
 exactly why it cannot stand in for test 3.
 
+4. **The v4-only tunnel refuses `AF_INET6` (§5.5).** **[V]** `proxy/tests/ipv6_refusal.rs` drives
+   the assembled listener over a real loopback socket with `tunnel_has_v6: false`: SOCKS5
+   `ATYP=0x04` returns REP `0x08`, HTTP `CONNECT` to a v6 literal returns 403, and the dialer is
+   never handed either target — a refusal that still dialled would be a leak wearing an error
+   code. A v4 destination through the same listener still reaches the dialer, so the refusals are
+   specific rather than a listener that rejects everything. The resolver's half is covered by
+   `hickory_opts` pinning `LookupIpStrategy::Ipv4Only`, which is unit-tested but has not been
+   driven against a live server.
+
 Also required:
 - `PUSH_REPLY` DNS-capture parser against a corpus of real lines from several server types.
 - Management-interface escaping matrix (quotes, backslashes, leading/trailing spaces).
