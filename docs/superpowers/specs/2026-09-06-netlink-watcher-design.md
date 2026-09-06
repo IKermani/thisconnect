@@ -1,8 +1,8 @@
 # Netlink watcher — design
 
 Date: 2026-09-06
-Status: approved, not yet implemented
-Implements: `docs/SPEC.md` §5.2, "Netlink watcher — specified, NOT IMPLEMENTED [U]"
+Status: implemented and verified on Linux; macOS `PF_ROUTE` still outstanding
+Implements: `docs/SPEC.md` §5.2
 
 ## The defect
 
@@ -207,5 +207,5 @@ fails `EADDRNOTAVAIL` — a run whose `bind()` failed proves nothing about routi
 
 ## Documentation
 
-On landing, SPEC §5.2's "Netlink watcher — specified, NOT IMPLEMENTED [U]" becomes `[V]` for
-Linux, citing the verification run, and keeps the macOS `PF_ROUTE` half at `[U]`.
+SPEC §5.2's netlink watcher bullet is now `[V]` for Linux, citing the verification run, and
+keeps the macOS `PF_ROUTE` half at `[U]`.
