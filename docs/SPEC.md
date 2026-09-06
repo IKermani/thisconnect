@@ -360,10 +360,40 @@ Mirrored for IPv6 when the tun has a v6 address; otherwise the proxy refuses `AF
   tunnel route can never come back; the floor and the backstop do not depend on it, so egress
   answers `EHOSTUNREACH`/`ENETUNREACH` and the posture degrades toward more refusal. The daemon
   logs and changes nothing else.
-- **macOS `PF_ROUTE` — still specified, NOT IMPLEMENTED [U].** Scoped routes deleted out from
-  under a live session are not re-asserted. The exposure is smaller than the Linux one was,
-  because the kernel refuses to fall back to the physical interface rather than silently using
-  it, but stale-route reconciliation on daemon start remains the only defence.
+- **macOS `PF_ROUTE` — implemented and verified [V].** `daemon/src/policy/route_socket.rs` opens a
+  routing socket and reports `RTM_DELETE` and `RTM_DELADDR` as the same edge trigger netlink
+  provides on Linux, feeding the same `plan::reassert`. A routing socket has no multicast groups
+  to join and receives every routing message on the host as soon as it is open, so there is no
+  subscription step to get wrong. Verified on macOS 26.6.2 (Darwin 25.6.0, arm64) by
+  `scripts/verify-ifscope-macos.sh --confirm --watcher`: an interface-scoped default route deleted
+  out from under a live session is restored within ~50ms, well inside the 30-second sweep, so the
+  restoration is attributable to the trigger rather than to the periodic pass.
+- **Only `RTM_DELETE` is exercised end to end [V]; `RTM_DELADDR` is watched but unproven [U].**
+  The verification run deletes a scoped route, which is the case that matters and the only one
+  observed. `RTM_DELADDR` covers the utun address the scope is keyed on and is included for the
+  same reason Linux watches `RTM_DELADDR`, but no run has yet removed a tun address and observed
+  the wake. If that message did not arrive, the loss would be bounded by the 30-second sweep
+  rather than unbounded, and the tunnel route it protects cannot be restored once its device is
+  gone in any case.
+- **A `RTM_VERSION` bump degrades detection to sweep-only, silently.** The walker stops at the
+  first message whose version it was not compiled against, rather than skipping it, because the
+  type byte's position is only guaranteed for the version it knows. The consequence is worth
+  stating plainly: on a future Darwin that bumps the version, deletions would go unnoticed by the
+  trigger and be caught only by the 30-second sweep, with nothing louder than that to say so.
+- **What the macOS watcher is for is availability, not leak prevention.** This is the one place
+  the two platforms differ in kind. Deleting the Linux rules makes traffic *escape*; deleting the
+  macOS scoped route makes the kernel refuse to fall back to the physical interface, so the tunnel
+  fails closed and simply stops carrying traffic. The watcher therefore restores connectivity a
+  third party broke — it is not closing a leak, because there was none to close. Its control is
+  built accordingly: it proves nothing *except* the watcher puts the route back, since "the route
+  is present at the end" would otherwise be satisfied by a deletion that never took effect **[V]**.
+- **`RTM_ADD` is deliberately not watched.** Our own re-assertion emits it, and a watcher that
+  observed it would wake on the change it had just made. Confirmed with `route -n monitor`: a
+  scoped-route deletion is broadcast to unrelated listeners, and the pid it carries is the
+  `/sbin/route` child that made the change, not the daemon — so a deletion we caused cannot be
+  told apart from one another VPN client caused, and pid filtering is not available **[V]**.
+  Nothing needs it: re-assertion is check-then-apply per step and teardown holds the
+  `InstalledPolicy` guard across itself.
 - **Teardown order:** stop listener → kill live sessions → remove tunnel route → remove rule →
   remove floor → remove backstop. The backstop is removed last, and only after the rule is confirmed
   gone; it is the outermost layer, so it is installed first and torn down last. Every intermediate
@@ -403,7 +433,8 @@ The kernel's refusal to fall back to `en0` is a free, race-proof kill switch. `E
 is surfaced in the UI as "tunnel not ready", never as a generic network error.
 
 Stale scoped routes pointing at a dead or recycled utun are a correctness *and* security hazard:
-reconcile on daemon start, and watch `PF_ROUTE`.
+reconcile on daemon start, and watch `PF_ROUTE`. Both now exist — `PolicyManager::reconcile` and
+`daemon/src/policy/route_socket.rs` respectively.
 
 ### 5.3 Egress dialer (unprivileged, proxy worker)
 

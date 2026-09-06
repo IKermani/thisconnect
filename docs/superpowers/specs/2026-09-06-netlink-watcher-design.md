@@ -1,7 +1,7 @@
 # Netlink watcher — design
 
 Date: 2026-09-06
-Status: implemented and verified on Linux; macOS `PF_ROUTE` still outstanding
+Status: implemented and verified on Linux and macOS
 Implements: `docs/SPEC.md` §5.2
 
 ## The defect
@@ -22,10 +22,13 @@ hardening.
 
 ## Scope
 
-Linux only. macOS keeps its `PF_ROUTE` equivalent marked `[U]` in SPEC §5.2; the interface
-below is shaped so a `PF_ROUTE` backend slots in without moving the re-assertion logic. On
-macOS the kernel's refusal to fall back to the physical interface is itself a floor, so the
-exposure is smaller and this box cannot verify a macOS fix anyway.
+Linux first. The interface below is shaped so a `PF_ROUTE` backend slots in without moving the
+re-assertion logic, and that is what happened: `daemon/src/policy/route_socket.rs` implements the
+same `PolicyWatch`/`Trigger` contract for macOS, and `plan::reassert`, the teardown guard and the
+watchdog loop were reused unchanged. The one thing that did not carry over is the *reason*: on
+macOS the kernel's refusal to fall back to the physical interface is itself a floor, so a deleted
+scoped route costs connectivity rather than leaking, and the watcher there restores availability
+rather than closing a leak.
 
 ## Transport: raw `AF_NETLINK` over libc
 

@@ -75,7 +75,7 @@ async fn drive_bounded(
             return;
         }
         if matches!(reason, Trigger::Desynchronised) {
-            warn!("netlink reported dropped messages; re-asserting tunnel policy unconditionally");
+            warn!("the policy watch reported dropped messages; re-asserting tunnel policy unconditionally");
         }
         report(reassert(&driver).await);
         // Coalesce whatever arrived while the probes were running, then hold the floor.
@@ -86,8 +86,8 @@ async fn drive_bounded(
 
 async fn reassert(driver: &Arc<dyn TunnelPolicyDriver>) -> Reassertion {
     let driver = Arc::clone(driver);
-    // The probes shell out to `ip`, which blocks. Running them on the async worker would stall
-    // the IPC server behind a routing change.
+    // The probes shell out to a blocking external command -- `ip` on Linux, `route` on macOS.
+    // Running them on the async worker would stall the IPC server behind a routing change.
     tokio::task::spawn_blocking(move || driver.reassert())
         .await
         .unwrap_or_default()
@@ -234,171 +234,314 @@ mod tests {
         .expect("the watchdog must stop when shutdown is signalled");
     }
 
-    use crate::policy::{LinuxPolicy, PolicyManager, RawTunnel, SystemRunner};
-    use crate::session::tunnel::ManagedPolicy;
+    /// The end-to-end proof needs `ip`, a tun and a private network namespace, none of
+    /// which exist on macOS. The rest of this module is platform-neutral and runs on both.
+    #[cfg(target_os = "linux")]
+    mod netns {
+        use super::*;
 
-    const TEST_TUN: &str = "tc-watch0";
-    const TEST_ESCAPE: &str = "tc-watch-esc";
-    const TEST_TUN_IP: &str = "10.255.254.2";
-    const TEST_ESCAPE_IP: &str = "10.255.253.1";
-    const TEST_DST: &str = "1.1.1.1";
+        use crate::policy::{LinuxPolicy, PolicyManager, RawTunnel, SystemRunner};
+        use crate::session::tunnel::ManagedPolicy;
 
-    fn ip(args: &[&str]) -> std::process::Output {
-        std::process::Command::new("ip")
-            .args(args)
-            .output()
-            .expect("ip(8) must be present")
-    }
+        const TEST_TUN: &str = "tc-watch0";
+        const TEST_ESCAPE: &str = "tc-watch-esc";
+        const TEST_TUN_IP: &str = "10.255.254.2";
+        const TEST_ESCAPE_IP: &str = "10.255.253.1";
+        const TEST_DST: &str = "1.1.1.1";
 
-    fn must_ip(args: &[&str]) {
-        let output = ip(args);
-        assert!(
-            output.status.success(),
-            "ip {}: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
+        fn ip(args: &[&str]) -> std::process::Output {
+            std::process::Command::new("ip")
+                .args(args)
+                .output()
+                .expect("ip(8) must be present")
+        }
 
-    /// Which device the kernel picks for a packet sourced from the tun address. Empty when the
-    /// lookup fails, which is the fail-closed answer.
-    fn selected_device() -> String {
-        let output = ip(&["route", "get", TEST_DST, "from", TEST_TUN_IP]);
-        let text = String::from_utf8_lossy(&output.stdout);
-        let mut fields = text.split_whitespace();
-        while let Some(field) = fields.next() {
-            if field == "dev" {
-                return fields.next().unwrap_or_default().to_owned();
+        fn must_ip(args: &[&str]) {
+            let output = ip(args);
+            assert!(
+                output.status.success(),
+                "ip {}: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        /// Which device the kernel picks for a packet sourced from the tun address. Empty when the
+        /// lookup fails, which is the fail-closed answer.
+        fn selected_device() -> String {
+            let output = ip(&["route", "get", TEST_DST, "from", TEST_TUN_IP]);
+            let text = String::from_utf8_lossy(&output.stdout);
+            let mut fields = text.split_whitespace();
+            while let Some(field) = fields.next() {
+                if field == "dev" {
+                    return fields.next().unwrap_or_default().to_owned();
+                }
+            }
+            String::new()
+        }
+
+        fn rules_present() -> bool {
+            let text = String::from_utf8_lossy(&ip(&["rule", "show"]).stdout).into_owned();
+            text.contains(&format!("from {TEST_TUN_IP} lookup 218"))
+                && text.contains(&format!("from {TEST_TUN_IP} unreachable"))
+        }
+
+        fn delete_both_rules() {
+            must_ip(&["rule", "del", "priority", "18000"]);
+            must_ip(&["rule", "del", "priority", "18500"]);
+        }
+
+        /// Removes the throwaway devices even when an assertion unwinds. Without this a failed run
+        /// leaves a tun behind and every later run refuses to start.
+        struct Devices;
+
+        impl Drop for Devices {
+            fn drop(&mut self) {
+                let _ = ip(&["link", "del", TEST_ESCAPE]);
+                let _ = ip(&["link", "del", TEST_TUN]);
             }
         }
-        String::new()
-    }
 
-    fn rules_present() -> bool {
-        let text = String::from_utf8_lossy(&ip(&["rule", "show"]).stdout).into_owned();
-        text.contains(&format!("from {TEST_TUN_IP} lookup 218"))
-            && text.contains(&format!("from {TEST_TUN_IP} unreachable"))
-    }
+        /// Needs CAP_NET_ADMIN in a private network namespace; run by
+        /// `scripts/verify-egress-linux.sh --watcher`.
+        #[tokio::test]
+        #[ignore = "needs CAP_NET_ADMIN in a private netns"]
+        async fn the_watcher_restores_rules_deleted_under_a_live_session() {
+            must_ip(&["link", "set", "lo", "up"]);
+            let _devices = Devices;
 
-    fn delete_both_rules() {
-        must_ip(&["rule", "del", "priority", "18000"]);
-        must_ip(&["rule", "del", "priority", "18500"]);
-    }
+            // The tun the policy is keyed on.
+            must_ip(&["tuntap", "add", "dev", TEST_TUN, "mode", "tun"]);
+            must_ip(&["addr", "add", &format!("{TEST_TUN_IP}/24"), "dev", TEST_TUN]);
+            must_ip(&["link", "set", "dev", TEST_TUN, "mtu", "1400", "up"]);
 
-    /// Removes the throwaway devices even when an assertion unwinds. Without this a failed run
-    /// leaves a tun behind and every later run refuses to start.
-    struct Devices;
+            // The escape path: what table main offers once our rules are gone. On a real host this
+            // is the physical link; manufacturing it here is what makes the control conclusive.
+            must_ip(&["link", "add", TEST_ESCAPE, "type", "dummy"]);
+            must_ip(&[
+                "addr",
+                "add",
+                &format!("{TEST_ESCAPE_IP}/24"),
+                "dev",
+                TEST_ESCAPE,
+            ]);
+            must_ip(&["link", "set", "dev", TEST_ESCAPE, "up"]);
+            must_ip(&[
+                "route",
+                "add",
+                "default",
+                "dev",
+                TEST_ESCAPE,
+                "metric",
+                "500",
+            ]);
 
-    impl Drop for Devices {
-        fn drop(&mut self) {
-            let _ = ip(&["link", "del", TEST_ESCAPE]);
-            let _ = ip(&["link", "del", TEST_TUN]);
+            let driver = Arc::new(ManagedPolicy::new(PolicyManager::new(
+                Box::new(LinuxPolicy::system()),
+                SystemRunner,
+            )));
+            let spec = crate::policy::TunnelSpec::parse(RawTunnel {
+                device: TEST_TUN,
+                local_v4: TEST_TUN_IP,
+                gateway_v4: None,
+                mtu: 1400,
+                ..RawTunnel::default()
+            })
+            .expect("valid spec");
+            let binding = driver.install(spec, 1400).expect("policy installed");
+            assert!(rules_present(), "the install did not read back");
+            assert_eq!(
+                selected_device(),
+                TEST_TUN,
+                "with the policy installed the lookup must select the tun"
+            );
+
+            // ---- Control: no watcher. The deletion must be seen to cause a leak. ----
+            delete_both_rules();
+            let escaped = selected_device();
+            assert!(
+                !escaped.is_empty() && escaped != TEST_TUN,
+                "INCONCLUSIVE: with both rules deleted and no watcher running, the address selected \
+                 '{escaped}' rather than escaping via '{TEST_ESCAPE}'. This environment cannot \
+                 demonstrate the leak, so restoring the rules below would prove nothing."
+            );
+            assert!(
+                !rules_present(),
+                "the control's deletion did not take effect"
+            );
+
+            // Put the policy back by hand so the watched half starts from the same state.
+            assert_eq!(
+                driver.reassert().restored.len(),
+                2,
+                "re-assertion must restore exactly the two rules the control deleted"
+            );
+            assert!(rules_present());
+
+            // ---- The assertion: same deletion, watcher running. ----
+            let watch = crate::policy::PolicyWatch::open().expect("netlink socket");
+            let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+            let watchdog = tokio::spawn(run(
+                watch,
+                Arc::clone(&driver) as Arc<dyn TunnelPolicyDriver>,
+                shutdown_rx,
+            ));
+
+            delete_both_rules();
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !rules_present() && std::time::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+
+            assert!(
+                rules_present(),
+                "the watcher did not restore both rules within 10s of their deletion"
+            );
+            assert_eq!(
+                selected_device(),
+                TEST_TUN,
+                "the rules came back but the lookup still leaves via another device"
+            );
+
+            watchdog.abort();
+            driver.teardown(&binding).expect("torn down");
         }
     }
 
-    /// Needs CAP_NET_ADMIN in a private network namespace; run by
-    /// `scripts/verify-egress-linux.sh --watcher`.
-    #[tokio::test]
-    #[ignore = "needs CAP_NET_ADMIN in a private netns"]
-    async fn the_watcher_restores_rules_deleted_under_a_live_session() {
-        must_ip(&["link", "set", "lo", "up"]);
-        let _devices = Devices;
+    /// The end-to-end proof on macOS. Needs root and a throwaway utun, both supplied by
+    /// `scripts/verify-ifscope-macos.sh --watcher`, which owns the PF_SYSTEM dance that brings a
+    /// utun into existence.
+    #[cfg(target_os = "macos")]
+    mod scoped_route {
+        use super::*;
+        use crate::policy::{MacosPolicy, PolicyManager, RawTunnel, SystemRunner, TunnelSpec};
+        use crate::session::tunnel::ManagedPolicy;
 
-        // The tun the policy is keyed on.
-        must_ip(&["tuntap", "add", "dev", TEST_TUN, "mode", "tun"]);
-        must_ip(&["addr", "add", &format!("{TEST_TUN_IP}/24"), "dev", TEST_TUN]);
-        must_ip(&["link", "set", "dev", TEST_TUN, "mtu", "1400", "up"]);
+        const ROUTE: &str = "/sbin/route";
 
-        // The escape path: what table main offers once our rules are gone. On a real host this
-        // is the physical link; manufacturing it here is what makes the control conclusive.
-        must_ip(&["link", "add", TEST_ESCAPE, "type", "dummy"]);
-        must_ip(&[
-            "addr",
-            "add",
-            &format!("{TEST_ESCAPE_IP}/24"),
-            "dev",
-            TEST_ESCAPE,
-        ]);
-        must_ip(&["link", "set", "dev", TEST_ESCAPE, "up"]);
-        must_ip(&[
-            "route",
-            "add",
-            "default",
-            "dev",
-            TEST_ESCAPE,
-            "metric",
-            "500",
-        ]);
-
-        let driver = Arc::new(ManagedPolicy::new(PolicyManager::new(
-            Box::new(LinuxPolicy::system()),
-            SystemRunner,
-        )));
-        let spec = crate::policy::TunnelSpec::parse(RawTunnel {
-            device: TEST_TUN,
-            local_v4: TEST_TUN_IP,
-            gateway_v4: None,
-            mtu: 1400,
-            ..RawTunnel::default()
-        })
-        .expect("valid spec");
-        let binding = driver.install(spec, 1400).expect("policy installed");
-        assert!(rules_present(), "the install did not read back");
-        assert_eq!(
-            selected_device(),
-            TEST_TUN,
-            "with the policy installed the lookup must select the tun"
-        );
-
-        // ---- Control: no watcher. The deletion must be seen to cause a leak. ----
-        delete_both_rules();
-        let escaped = selected_device();
-        assert!(
-            !escaped.is_empty() && escaped != TEST_TUN,
-            "INCONCLUSIVE: with both rules deleted and no watcher running, the address selected \
-             '{escaped}' rather than escaping via '{TEST_ESCAPE}'. This environment cannot \
-             demonstrate the leak, so restoring the rules below would prove nothing."
-        );
-        assert!(
-            !rules_present(),
-            "the control's deletion did not take effect"
-        );
-
-        // Put the policy back by hand so the watched half starts from the same state.
-        assert_eq!(
-            driver.reassert().restored.len(),
-            2,
-            "re-assertion must restore exactly the two rules the control deleted"
-        );
-        assert!(rules_present());
-
-        // ---- The assertion: same deletion, watcher running. ----
-        let watch = crate::policy::PolicyWatch::open().expect("netlink socket");
-        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let watchdog = tokio::spawn(run(
-            watch,
-            Arc::clone(&driver) as Arc<dyn TunnelPolicyDriver>,
-            shutdown_rx,
-        ));
-
-        delete_both_rules();
-
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while !rules_present() && std::time::Instant::now() < deadline {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        fn env(key: &str) -> String {
+            std::env::var(key).unwrap_or_else(|_| {
+                panic!(
+                    "{key} is unset: run this through `sudo ./scripts/verify-ifscope-macos.sh \
+                     --confirm --watcher`, which creates the utun this test needs"
+                )
+            })
         }
 
-        assert!(
-            rules_present(),
-            "the watcher did not restore both rules within 10s of their deletion"
-        );
-        assert_eq!(
-            selected_device(),
-            TEST_TUN,
-            "the rules came back but the lookup still leaves via another device"
-        );
+        fn route(args: &[&str]) -> std::process::Output {
+            std::process::Command::new(ROUTE)
+                .args(args)
+                .output()
+                .expect("/sbin/route must be present")
+        }
 
-        watchdog.abort();
-        driver.teardown(&binding).expect("torn down");
+        /// Whether the interface-scoped default route is installed for `device`.
+        ///
+        /// `route -n get` exits non-zero precisely when there is no such route, which is why the
+        /// policy's own teardown check treats a failing probe as proof of absence.
+        fn scoped_route_present(device: &str) -> bool {
+            let output = route(&["-n", "get", "-inet", "-ifscope", device, "default"]);
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains(&format!("interface: {device}"))
+        }
+
+        fn delete_scoped_route(device: &str, peer: &str) {
+            let output = route(&["-n", "delete", "-inet", "-ifscope", device, "default", peer]);
+            assert!(
+                output.status.success(),
+                "could not delete the scoped route this test exists to restore: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        /// Needs root and a throwaway utun; run by `scripts/verify-ifscope-macos.sh --watcher`.
+        ///
+        /// Note what the control asserts here, and how it differs from the Linux one. Deleting
+        /// Linux's policy rules makes traffic *escape*, so that control requires the address to be
+        /// seen leaving over another device. On macOS a missing scoped route makes the kernel
+        /// refuse to fall back to the physical interface at all — the failure is `ENETUNREACH`,
+        /// not a leak, and `verify-ifscope-macos.sh` already proves that separately. So what this
+        /// control must establish is the other half: that nothing *except* the watcher puts the
+        /// route back. Without it, "the route is present at the end" would be satisfied by a
+        /// deletion that never took effect.
+        #[tokio::test]
+        #[ignore = "needs root and a throwaway utun"]
+        async fn the_watcher_restores_a_deleted_scoped_route() {
+            let device = env("THISCONNECT_TEST_UTUN");
+            let local = env("THISCONNECT_TEST_LOCAL");
+            let peer = env("THISCONNECT_TEST_PEER");
+
+            let driver = Arc::new(ManagedPolicy::new(PolicyManager::new(
+                Box::new(MacosPolicy::default()),
+                SystemRunner,
+            )));
+            let spec = TunnelSpec::parse(RawTunnel {
+                device: &device,
+                local_v4: &local,
+                gateway_v4: Some(&peer),
+                mtu: 1400,
+                ..RawTunnel::default()
+            })
+            .expect("valid spec");
+            let binding = driver.install(spec, 1400).expect("policy installed");
+            assert!(
+                scoped_route_present(&device),
+                "the install did not read back a scoped default route on {device}"
+            );
+
+            // ---- Control: no watcher. The deletion must take effect AND must stay. ----
+            delete_scoped_route(&device, &peer);
+            assert!(
+                !scoped_route_present(&device),
+                "INCONCLUSIVE: the deletion did not remove the scoped route, so restoring it \
+                 below would prove nothing"
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            assert!(
+                !scoped_route_present(&device),
+                "INCONCLUSIVE: the scoped route came back with no watcher running, so something \
+                 other than the watchdog restores it and this test cannot attribute a pass"
+            );
+
+            // Put it back by hand so the watched half starts from the same state.
+            let restored = driver.reassert();
+            assert_eq!(
+                restored.restored.len(),
+                1,
+                "re-assertion must restore exactly the one scoped route macOS installs"
+            );
+            assert!(scoped_route_present(&device));
+
+            // ---- The assertion: same deletion, watcher running. ----
+            let watch = crate::policy::PolicyWatch::open().expect("PF_ROUTE socket");
+            let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+            let watchdog = tokio::spawn(run(
+                watch,
+                Arc::clone(&driver) as Arc<dyn TunnelPolicyDriver>,
+                shutdown_rx,
+            ));
+
+            delete_scoped_route(&device, &peer);
+
+            // Well inside SWEEP_INTERVAL, so a pass is attributable to the PF_ROUTE edge trigger
+            // rather than to the periodic sweep that would eventually repair it anyway.
+            assert!(
+                SWEEP_INTERVAL > std::time::Duration::from_secs(10),
+                "the deadline below only isolates the trigger while it is under the sweep"
+            );
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !scoped_route_present(&device) && std::time::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+
+            assert!(
+                scoped_route_present(&device),
+                "the watcher did not restore the scoped route within 10s of its deletion"
+            );
+
+            watchdog.abort();
+            driver.teardown(&binding).expect("torn down");
+        }
     }
 }

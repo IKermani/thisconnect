@@ -25,7 +25,10 @@ mod macos;
 mod netlink;
 mod plan;
 mod reconcile;
+#[cfg(target_os = "macos")]
+mod route_socket;
 mod types;
+mod watch;
 
 use std::net::IpAddr;
 
@@ -33,13 +36,16 @@ pub use command::{Command, CommandOutput, CommandRunner, SystemRunner};
 pub use linux::LinuxPolicy;
 pub use macos::MacosPolicy;
 #[cfg(target_os = "linux")]
-pub use netlink::{PolicyWatch, Trigger, WatchError};
+pub use netlink::{PolicyWatch, WatchError};
 pub use plan::{Check, Plan, Reassertion, Step, StepKind};
 pub use reconcile::ReconcileReport;
+#[cfg(target_os = "macos")]
+pub use route_socket::{PolicyWatch, WatchError};
 pub use types::{
     DeviceName, Family, Mtu, RawTunnel, Topology, TunnelEndpoint, TunnelSpec, POLICY_TABLE,
     RULE_PRIORITY,
 };
+pub use watch::Trigger;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PolicyError {
