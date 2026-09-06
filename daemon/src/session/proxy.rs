@@ -172,17 +172,17 @@ impl ProxyPublisher {
     fn plan_dns(&self, binding: &TunnelBinding) -> Result<TunnelDnsPlan, ProxyError> {
         match self.capture.current() {
             DnsCapture::Captured(dns) => {
-                if dns.tunnel_has_v6 != binding.tunnel_has_v6 {
+                if dns.tunnel_has_v6 != binding.tunnel_has_v6() {
                     // The installed policy wins: it describes what was actually
                     // put on the machine and read back, the push only what was
                     // asked for.
                     warn!(
                         pushed = dns.tunnel_has_v6,
-                        installed = binding.tunnel_has_v6,
+                        installed = binding.tunnel_has_v6(),
                         "the push and the installed policy disagree about IPv6; the installed policy wins"
                     );
                 }
-                let vetted = usable_servers(&dns.nameservers, binding.tunnel_has_v6);
+                let vetted = usable_servers(&dns.nameservers, binding.tunnel_has_v6());
                 if vetted.usable.is_empty() {
                     return self.fallback_plan(vetted.gap(), binding);
                 }
@@ -215,7 +215,7 @@ impl ProxyPublisher {
         // The configured fallback is vetted by the same rule as the push: a
         // `fallback_dns` of 127.0.0.1 in the config would otherwise be the system
         // resolver wearing a tunnel-shaped hat.
-        let vetted = usable_servers(&self.settings.fallback_dns, binding.tunnel_has_v6);
+        let vetted = usable_servers(&self.settings.fallback_dns, binding.tunnel_has_v6());
         if vetted.denied > 0 {
             warn!(
                 denied = vetted.denied,

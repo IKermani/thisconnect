@@ -2,9 +2,12 @@
 
 //! Linux tunnel policy: a source-address rule into a private table (SPEC.md §5.2).
 //!
-//! Exercised on Ubuntu 24.04 / iproute2 6.1.0 by `scripts/verify-egress-linux.sh`, and end to end
-//! against a real server by `scripts/verify-live-tunnel.sh`. The v6 mirror below has still never
-//! run: every live tunnel so far has been v4-only. Not yet run on Debian stable or Fedora.
+//! Exercised on both families by `scripts/verify-egress-linux.sh` on Ubuntu 24.04, Debian 12,
+//! Debian 13 and Fedora 41 (iproute2 6.1.0 through 6.15.0), and end to end against a real server
+//! by `scripts/verify-live-tunnel.sh`. The v6 steps below are verified against a synthetic tun;
+//! no *live* tunnel has ever carried v6, so the pushed-`ifconfig-ipv6` path into these steps is
+//! still untested. Nothing re-asserts any of this after install — see the netlink watcher in
+//! SPEC.md §5.2, which is specified and not implemented.
 //!
 //! Three details are load-bearing and must not be "simplified":
 //!
