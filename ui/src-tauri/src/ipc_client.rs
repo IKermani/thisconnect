@@ -425,4 +425,52 @@ mod tests {
             .expect("request should succeed");
         assert!(matches!(response, Response::Ack));
     }
+
+    #[tokio::test]
+    async fn connect_to_missing_socket_reports_not_running() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Never bound: nothing listens here.
+        let path = dir.path().join("nothing-here.sock");
+
+        let (sink_tx, mut sink_rx) = mpsc::unbounded_channel::<ActorEvent>();
+        let _handle = spawn(sink_tx, path);
+
+        let event = tokio::time::timeout(Duration::from_secs(2), sink_rx.recv())
+            .await
+            .expect("no timeout")
+            .expect("channel open");
+        assert!(matches!(
+            event,
+            ActorEvent::ConnectionLost(DaemonUnreachableReason::NotRunning)
+        ));
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn connect_to_unreadable_socket_reports_permission_denied() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("locked.sock");
+        let listener = UnixListener::bind(&path).expect("bind");
+        // Keep the listener alive but unreachable: strip all permissions on
+        // the socket path so connect() itself fails EACCES before any accept.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).expect("chmod 000");
+        tokio::spawn(async move {
+            // Keep the listener from being dropped/unlinked for the test's duration.
+            let _ = listener.accept().await;
+        });
+
+        let (sink_tx, mut sink_rx) = mpsc::unbounded_channel::<ActorEvent>();
+        let _handle = spawn(sink_tx, path);
+
+        let event = tokio::time::timeout(Duration::from_secs(2), sink_rx.recv())
+            .await
+            .expect("no timeout")
+            .expect("channel open");
+        assert!(matches!(
+            event,
+            ActorEvent::ConnectionLost(DaemonUnreachableReason::PermissionDenied)
+        ));
+    }
 }
