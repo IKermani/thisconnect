@@ -241,8 +241,9 @@ fn recv(fd: &OwnedFd, buffer: &mut [u8]) -> io::Result<usize> {
     if read < 0 {
         return Err(io::Error::last_os_error());
     }
-    // A non-negative ssize_t always fits usize on every target this daemon builds for.
-    Ok(read.max(0) as usize)
+    // read >= 0 here (negative already returned above), and a non-negative ssize_t always fits
+    // usize on every target this daemon builds for.
+    Ok(read as usize)
 }
 
 #[cfg(test)]

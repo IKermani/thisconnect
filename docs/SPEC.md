@@ -353,7 +353,9 @@ Mirrored for IPv6 when the tun has a v6 address; otherwise the proxy refuses `AF
   lookup for the tun source address stayed on the tun. The assertion carries a control: the same
   deletion with no watcher running must first be *seen* to send the address out over a dummy
   device, or the run reports INCONCLUSIVE rather than passing. Driven by
-  `scripts/verify-egress-linux.sh --watcher`.
+  `scripts/verify-egress-linux.sh --watcher`. That bound only starts once `install` has returned:
+  while `install` is still applying later steps, the trigger cannot see the session yet, so a step
+  deleted during install is restored by the 30-second periodic sweep, not by the trigger.
 - **A step that cannot be restored is reported, not escalated.** If the tun device is gone the
   tunnel route can never come back; the floor and the backstop do not depend on it, so egress
   answers `EHOSTUNREACH`/`ENETUNREACH` and the posture degrades toward more refusal. The daemon

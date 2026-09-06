@@ -699,12 +699,16 @@ run_watcher_test() {
   step "Test: the netlink watcher re-asserts policy deleted mid-session"
   command -v cargo >/dev/null || die "--watcher needs cargo"
   command -v unshare >/dev/null || die "--watcher needs util-linux's unshare(1)"
+  command -v timeout >/dev/null || die "--watcher needs coreutils' timeout(1)"
   say "Building the daemon test binary (outside the namespace)"
   cargo test -p thisconnect-daemon --bin thisconnectd --no-run ||
     die "the daemon test binary does not build"
   say "Running the watcher test inside a private user+network namespace"
+  # The test has a 10s internal deadline, but a cold `cargo test` build inside the namespace can
+  # be slow; 300s is generous enough not to be a false FAIL but finite enough that a deadlock in
+  # the code under test resolves to FAIL instead of hanging the whole verification run forever.
   local output rc=0
-  output="$(unshare --user --map-root-user --net -- \
+  output="$(timeout 300 unshare --user --map-root-user --net -- \
     cargo test -p thisconnect-daemon --bin thisconnectd -- \
     --ignored --nocapture --test-threads=1 the_watcher_restores 2>&1)" || rc=$?
   printf '%s\n' "$output"

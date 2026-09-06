@@ -117,6 +117,12 @@ impl<R: CommandRunner> TunnelPolicyDriver for ManagedPolicy<R> {
     fn install(&self, spec: TunnelSpec, mtu: u32) -> Result<TunnelBinding, PolicyError> {
         let installed = self.manager.install(spec)?;
         let binding = TunnelBinding::from_installed(&installed, mtu)?;
+        // Only after every step is applied and read back does the netlink trigger have anything
+        // to re-assert against: `reassert` no-ops while this mutex is empty. A step deleted while
+        // `manager.install` is still working through later ones is therefore invisible to the
+        // trigger and waits for the next periodic sweep instead of being restored instantly. The
+        // other layers (the backstop rule, the floor route) are fail-closed throughout, so what
+        // this window costs is delayed re-assertion, not an open leak.
         *lock(&self.installed) = Some(installed);
         Ok(binding)
     }
