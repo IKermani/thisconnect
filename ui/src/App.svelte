@@ -9,8 +9,9 @@
   import { refreshProfiles } from './lib/stores/profiles';
   import Connect from './routes/Connect.svelte';
   import Profiles from './routes/Profiles.svelte';
+  import ProxyInfo from './routes/ProxyInfo.svelte';
 
-  type Tab = 'connect' | 'profiles';
+  type Tab = 'connect' | 'profiles' | 'proxy';
   let activeTab = $state<Tab>('connect');
 
   onMount(async () => {
@@ -27,13 +28,18 @@
   <button onclick={() => (activeTab = 'profiles')} aria-current={activeTab === 'profiles'}>
     Profiles
   </button>
+  <button onclick={() => (activeTab = 'proxy')} aria-current={activeTab === 'proxy'}>
+    Proxy
+  </button>
 </nav>
 
 <main>
   {#if activeTab === 'connect'}
     <Connect />
-  {:else}
+  {:else if activeTab === 'profiles'}
     <Profiles />
+  {:else if activeTab === 'proxy'}
+    <ProxyInfo />
   {/if}
 </main>
 <PromptDialog />
