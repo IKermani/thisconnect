@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { writable } from 'svelte/store';
-import { proxyInfo as fetchProxyInfo, proxyStats as fetchProxyStats } from '../ipc';
+import {
+  onDaemonEvent,
+  proxyInfo as fetchProxyInfo,
+  proxyStats as fetchProxyStats,
+} from '../ipc';
 import type { ProxyInfo, ProxySessionStats } from '../types';
 import { connectionState } from './connection';
 
@@ -38,6 +42,16 @@ export function initProxyStore(): void {
     } else {
       stopProxyStatsPolling();
       proxyStats.set(null);
+    }
+  });
+
+  void onDaemonEvent((event) => {
+    if (event.type === 'proxy_listener_up') {
+      fetchProxyInfo()
+        .then((info) => proxyInfo.set(info))
+        .catch(() => proxyInfo.set(null));
+    } else if (event.type === 'proxy_listener_down') {
+      proxyInfo.set(null);
     }
   });
 }

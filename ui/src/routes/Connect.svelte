@@ -1,6 +1,6 @@
 <script lang="ts">
   // SPDX-License-Identifier: GPL-3.0-or-later
-  import { byteCount, connectionState, lastError, reachability, tunnel } from '../lib/stores/connection';
+  import { byteCount, connectionState, lastError, tunnel } from '../lib/stores/connection';
   import { profiles } from '../lib/stores/profiles';
   import { selectedProfileId } from '../lib/stores/selection';
   import { proxyStats } from '../lib/stores/proxy';
@@ -32,20 +32,6 @@
     $profiles.find((p) => p.id === $selectedProfileId)?.name ?? null,
   );
 </script>
-
-{#if !$reachability.reachable}
-  <div class="banner">
-    {#if $reachability.reason.reason === 'permission_denied'}
-      Daemon unreachable: your account was just added to the required group. Log out and back
-      in, then reopen thisconnect.
-    {:else if $reachability.reason.reason === 'protocol_mismatch'}
-      Daemon speaks a different protocol version ({$reachability.reason.daemon_version}) than
-      this GUI. Update one of them to match.
-    {:else}
-      thisconnectd is not running. Start the daemon service and reopen thisconnect.
-    {/if}
-  </div>
-{/if}
 
 <section>
   <h2>Status: {$connectionState}</h2>
@@ -96,11 +82,6 @@
 </section>
 
 <style>
-  .banner {
-    background: #b30000;
-    color: white;
-    padding: 0.5rem 1rem;
-  }
   .error {
     color: darkred;
   }

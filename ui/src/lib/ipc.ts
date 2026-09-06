@@ -12,6 +12,7 @@ import type {
   PromptReply,
   ProxyInfo,
   ProxySessionStats,
+  ReachabilityWire,
 } from './types';
 
 export function profileImport(name: string, config: string): Promise<ProfileSummary> {
@@ -52,6 +53,10 @@ export function proxyStats(): Promise<ProxySessionStats> {
 
 export function promptReply(promptId: PromptId, reply: PromptReply): Promise<void> {
   return invoke('prompt_reply', { promptId, reply });
+}
+
+export function reachability(): Promise<ReachabilityWire> {
+  return invoke('reachability');
 }
 
 export function onDaemonEvent(handler: (event: DaemonEvent) => void): Promise<UnlistenFn> {

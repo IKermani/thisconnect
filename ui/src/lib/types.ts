@@ -160,5 +160,10 @@ export type DaemonUnreachableReason =
 
 export type UiError =
   | ({ type: 'daemon' } & IpcError)
+  | { type: 'daemon_unreachable'; reason: DaemonUnreachableReason }
   | { type: 'timeout' }
   | { type: 'internal'; message: string };
+
+export type ReachabilityWire =
+  | { type: 'reachable' }
+  | { type: 'unreachable'; reason: DaemonUnreachableReason };

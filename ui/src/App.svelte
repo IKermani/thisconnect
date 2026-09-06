@@ -2,6 +2,7 @@
   // SPDX-License-Identifier: GPL-3.0-or-later
   import { onMount } from 'svelte';
   import { listen } from '@tauri-apps/api/event';
+  import DaemonUnreachableBanner from './lib/components/DaemonUnreachableBanner.svelte';
   import PromptDialog from './lib/components/PromptDialog.svelte';
   import { connect, disconnect } from './lib/ipc';
   import { initConnectionStore } from './lib/stores/connection';
@@ -20,9 +21,13 @@
   let activeTab = $state<Tab>('connect');
 
   onMount(async () => {
-    await Promise.all([initConnectionStore(), initLogStore(), initPromptStore()]);
+    await Promise.allSettled([initConnectionStore(), initLogStore(), initPromptStore()]);
     initProxyStore();
-    await refreshProfiles();
+    try {
+      await refreshProfiles();
+    } catch {
+      // Daemon may be down at startup; the Profiles tab has its own Refresh button.
+    }
 
     await listen('tray-connect-requested', () => {
       let id: string | null = null;
@@ -52,6 +57,8 @@
     Log
   </button>
 </nav>
+
+<DaemonUnreachableBanner />
 
 <main>
   {#if activeTab === 'connect'}
