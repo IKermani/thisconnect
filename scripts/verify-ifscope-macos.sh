@@ -48,6 +48,8 @@ DEFAULT_ROUTE_BEFORE=""
 GATEWAY_ROUTE_INSTALLED="no"
 INTERFACE_ROUTE_INSTALLED="no"
 SCOPED_LEAK="no"
+WATCHER="no"
+WATCHER_VERDICT=""
 
 say() { printf '%s\n' "$*"; }
 step() { printf '\n== %s\n' "$*"; }
@@ -79,6 +81,11 @@ Modes:
 
 Options:
   --confirm            Required. Without it nothing is changed; the plan is printed instead.
+  --watcher            Prove the PF_ROUTE watcher re-asserts a scoped route deleted out from
+                       under a live session (SPEC.md 5.2). Creates a throwaway utun, then runs
+                       the daemon's ignored watcher test against it. The test carries its own
+                       control and reports INCONCLUSIVE if the deletion cannot be shown to
+                       stick. Needs root, like every other mode here.
   --profile PATH       Use a real .ovpn profile instead of a synthetic utun.
   --dst IPV4           Probe destination (default 1.1.1.1).
   --port N             Probe destination port (default 443).
@@ -98,6 +105,7 @@ parse_args() {
       --confirm) CONFIRMED="yes" ;;
       --self-test) SELF_TEST="yes" ;;
       --compile-check) COMPILE_CHECK="yes" ;;
+      --watcher) WATCHER="yes" ;;
       --profile)
         [ "$#" -ge 2 ] || die "--profile needs a path"
         PROFILE="$2"
@@ -632,6 +640,54 @@ measure_with_scoped_route() {
   return "$rc"
 }
 
+# evaluate_watcher_verdict <rc> <output> -> "PASS ..." | "FAIL ..."
+#
+# A cargo test filter that matches nothing exits 0 having run nothing, so a bare exit-status
+# check would report PASS for a run that proved absolutely nothing. Evidence that the test
+# actually executed is therefore part of the pass condition, not a nicety.
+evaluate_watcher_verdict() {
+  local rc="$1" output="$2"
+  if [ "$rc" -ne 0 ]; then
+    echo "FAIL see the test output above; an INCONCLUSIVE control reports there too"
+    return 0
+  fi
+  if ! printf '%s' "$output" | grep -q "test result: ok"; then
+    echo "FAIL the watcher test did not report a result"
+    return 0
+  fi
+  if ! printf '%s' "$output" | grep -qE "running 1 test|the_watcher_restores_a_deleted_scoped_route \.\.\. ok"; then
+    echo "FAIL the test filter matched nothing, so the run proved nothing"
+    return 0
+  fi
+  echo "PASS the watcher restored the scoped route deleted under a live session"
+}
+
+# The watcher lives in the daemon, so this mode delegates to the daemon's own ignored test
+# rather than reimplementing re-assertion in shell. The binary is built as the invoking user --
+# running cargo under sudo would leave root-owned artefacts in the developer's target dir -- and
+# only the built binary is executed as root.
+run_watcher_test() {
+  step "Test: the PF_ROUTE watcher re-asserts a scoped route deleted mid-session"
+  command -v cargo >/dev/null || die "--watcher needs cargo"
+  [ -n "${SUDO_USER:-}" ] || die "--watcher needs SUDO_USER; run it through sudo, not as root directly"
+
+  say "Building the daemon test binary as $SUDO_USER (not as root)"
+  local build_log bin
+  build_log="$(sudo -u "$SUDO_USER" cargo test --bin thisconnectd --no-run 2>&1)" ||
+    { printf '%s\n' "$build_log"; die "the daemon test binary does not build"; }
+  bin="$(printf '%s\n' "$build_log" | sed -n 's/.*Executable unittests src\/main\.rs (\(.*\))/\1/p' | tail -1)"
+  [ -n "$bin" ] && [ -x "$bin" ] || die "could not locate the built test binary"
+  say "  + $bin"
+
+  local output rc=0
+  output="$(THISCONNECT_TEST_UTUN="$TUNNEL_DEV" \
+    THISCONNECT_TEST_LOCAL="$SYNTHETIC_LOCAL" \
+    THISCONNECT_TEST_PEER="$TUNNEL_PEER" \
+    "$bin" --ignored --nocapture --test-threads=1 the_watcher_restores_a_deleted_scoped_route 2>&1)" || rc=$?
+  printf '%s\n' "$output"
+  WATCHER_VERDICT="$(evaluate_watcher_verdict "$rc" "$output")"
+}
+
 print_plan() {
   cat <<EOF
 This run will, as root:
@@ -677,6 +733,24 @@ main() {
 
   trap cleanup EXIT INT TERM
   build_helpers
+
+  if [ "$WATCHER" = "yes" ]; then
+    [ -z "$PROFILE" ] || die "--watcher runs against a synthetic utun; --profile is not supported"
+    bring_up_synthetic_utun
+    run_watcher_test
+    step "VERDICT"
+    say "PF_ROUTE watcher: $WATCHER_VERDICT"
+    case "$WATCHER_VERDICT" in
+      FAIL*)
+        say ""
+        say "What a FAIL means: a scoped route deleted mid-session is not re-asserted, so SPEC.md"
+        say "5.2's macOS re-assertion latency stays unbounded and a live tunnel silently loses"
+        say "connectivity until the daemon restarts."
+        return 1
+        ;;
+    esac
+    return 0
+  fi
 
   step "Recording the system default route BEFORE any change"
   DEFAULT_ROUTE_BEFORE="$(snapshot_default_route)"
@@ -920,6 +994,48 @@ test_labels_known_errnos() {
   check_eq "labels_known_errnos" "ENETUNREACH(51)" "$(errno_label "$RC_ENETUNREACH")"
 }
 
+test_watcher_passes_on_a_real_run() {
+  local output
+  output="$(cat <<'EOF'
+running 1 test
+test session::watchdog::tests::scoped_route::the_watcher_restores_a_deleted_scoped_route ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 439 filtered out; finished in 1.31s
+EOF
+)"
+  check_prefix "watcher_passes_on_a_real_run" "PASS" "$(evaluate_watcher_verdict 0 "$output")"
+}
+
+# The silent-pass case: a filter that matches nothing still exits 0.
+test_watcher_fails_when_the_filter_matched_nothing() {
+  local output
+  output="$(cat <<'EOF'
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 440 filtered out; finished in 0.00s
+EOF
+)"
+  check_prefix "watcher_fails_when_the_filter_matched_nothing" "FAIL" \
+    "$(evaluate_watcher_verdict 0 "$output")"
+}
+
+test_watcher_fails_on_a_nonzero_exit() {
+  local output
+  output="$(cat <<'EOF'
+running 1 test
+test session::watchdog::tests::scoped_route::the_watcher_restores_a_deleted_scoped_route ... FAILED
+
+failures:
+---- the_watcher_restores_a_deleted_scoped_route stdout ----
+thread 'main' panicked at daemon/src/session/watchdog.rs:380:13:
+INCONCLUSIVE: the scoped route came back with no watcher running
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 439 filtered out
+EOF
+)"
+  check_prefix "watcher_fails_on_a_nonzero_exit" "FAIL" "$(evaluate_watcher_verdict 101 "$output")"
+}
+
 run_self_test() {
   test_picks_lowest_free_utun_unit
   test_reports_no_free_utun_unit_when_range_exhausted
@@ -945,6 +1061,9 @@ run_self_test() {
   test_fails_when_default_route_moved_while_scoped_route_installed
   test_fails_when_default_route_left_residue_after_teardown
   test_passes_only_when_both_route_checks_are_clean
+  test_watcher_passes_on_a_real_run
+  test_watcher_fails_when_the_filter_matched_nothing
+  test_watcher_fails_on_a_nonzero_exit
   test_labels_known_errnos
   say ""
   say "$((TESTS_RUN - TESTS_FAILED))/$TESTS_RUN self-tests passed"

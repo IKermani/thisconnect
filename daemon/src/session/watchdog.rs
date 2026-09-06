@@ -408,4 +408,140 @@ mod tests {
             driver.teardown(&binding).expect("torn down");
         }
     }
+
+    /// The end-to-end proof on macOS. Needs root and a throwaway utun, both supplied by
+    /// `scripts/verify-ifscope-macos.sh --watcher`, which owns the PF_SYSTEM dance that brings a
+    /// utun into existence.
+    #[cfg(target_os = "macos")]
+    mod scoped_route {
+        use super::*;
+        use crate::policy::{MacosPolicy, PolicyManager, RawTunnel, SystemRunner, TunnelSpec};
+        use crate::session::tunnel::ManagedPolicy;
+
+        const ROUTE: &str = "/sbin/route";
+
+        fn env(key: &str) -> String {
+            std::env::var(key).unwrap_or_else(|_| {
+                panic!(
+                    "{key} is unset: run this through `sudo ./scripts/verify-ifscope-macos.sh \
+                     --confirm --watcher`, which creates the utun this test needs"
+                )
+            })
+        }
+
+        fn route(args: &[&str]) -> std::process::Output {
+            std::process::Command::new(ROUTE)
+                .args(args)
+                .output()
+                .expect("/sbin/route must be present")
+        }
+
+        /// Whether the interface-scoped default route is installed for `device`.
+        ///
+        /// `route -n get` exits non-zero precisely when there is no such route, which is why the
+        /// policy's own teardown check treats a failing probe as proof of absence.
+        fn scoped_route_present(device: &str) -> bool {
+            let output = route(&["-n", "get", "-inet", "-ifscope", device, "default"]);
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains(&format!("interface: {device}"))
+        }
+
+        fn delete_scoped_route(device: &str, peer: &str) {
+            let output = route(&["-n", "delete", "-inet", "-ifscope", device, "default", peer]);
+            assert!(
+                output.status.success(),
+                "could not delete the scoped route this test exists to restore: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        /// Needs root and a throwaway utun; run by `scripts/verify-ifscope-macos.sh --watcher`.
+        ///
+        /// Note what the control asserts here, and how it differs from the Linux one. Deleting
+        /// Linux's policy rules makes traffic *escape*, so that control requires the address to be
+        /// seen leaving over another device. On macOS a missing scoped route makes the kernel
+        /// refuse to fall back to the physical interface at all — the failure is `ENETUNREACH`,
+        /// not a leak, and `verify-ifscope-macos.sh` already proves that separately. So what this
+        /// control must establish is the other half: that nothing *except* the watcher puts the
+        /// route back. Without it, "the route is present at the end" would be satisfied by a
+        /// deletion that never took effect.
+        #[tokio::test]
+        #[ignore = "needs root and a throwaway utun"]
+        async fn the_watcher_restores_a_deleted_scoped_route() {
+            let device = env("THISCONNECT_TEST_UTUN");
+            let local = env("THISCONNECT_TEST_LOCAL");
+            let peer = env("THISCONNECT_TEST_PEER");
+
+            let driver = Arc::new(ManagedPolicy::new(PolicyManager::new(
+                Box::new(MacosPolicy::default()),
+                SystemRunner,
+            )));
+            let spec = TunnelSpec::parse(RawTunnel {
+                device: &device,
+                local_v4: &local,
+                gateway_v4: Some(&peer),
+                mtu: 1400,
+                ..RawTunnel::default()
+            })
+            .expect("valid spec");
+            let binding = driver.install(spec, 1400).expect("policy installed");
+            assert!(
+                scoped_route_present(&device),
+                "the install did not read back a scoped default route on {device}"
+            );
+
+            // ---- Control: no watcher. The deletion must take effect AND must stay. ----
+            delete_scoped_route(&device, &peer);
+            assert!(
+                !scoped_route_present(&device),
+                "INCONCLUSIVE: the deletion did not remove the scoped route, so restoring it \
+                 below would prove nothing"
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            assert!(
+                !scoped_route_present(&device),
+                "INCONCLUSIVE: the scoped route came back with no watcher running, so something \
+                 other than the watchdog restores it and this test cannot attribute a pass"
+            );
+
+            // Put it back by hand so the watched half starts from the same state.
+            let restored = driver.reassert();
+            assert_eq!(
+                restored.restored.len(),
+                1,
+                "re-assertion must restore exactly the one scoped route macOS installs"
+            );
+            assert!(scoped_route_present(&device));
+
+            // ---- The assertion: same deletion, watcher running. ----
+            let watch = crate::policy::PolicyWatch::open().expect("PF_ROUTE socket");
+            let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+            let watchdog = tokio::spawn(run(
+                watch,
+                Arc::clone(&driver) as Arc<dyn TunnelPolicyDriver>,
+                shutdown_rx,
+            ));
+
+            delete_scoped_route(&device, &peer);
+
+            // Well inside SWEEP_INTERVAL, so a pass is attributable to the PF_ROUTE edge trigger
+            // rather than to the periodic sweep that would eventually repair it anyway.
+            assert!(
+                SWEEP_INTERVAL > std::time::Duration::from_secs(10),
+                "the deadline below only isolates the trigger while it is under the sweep"
+            );
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !scoped_route_present(&device) && std::time::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+
+            assert!(
+                scoped_route_present(&device),
+                "the watcher did not restore the scoped route within 10s of its deletion"
+            );
+
+            watchdog.abort();
+            driver.teardown(&binding).expect("torn down");
+        }
+    }
 }
