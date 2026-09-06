@@ -34,6 +34,9 @@ keyring = { version = "4", features = ["v1"] }
 security-framework = { workspace = true }
 core-foundation = { workspace = true }
 
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
 [features]
 # Relaxes IPC peer authentication for local development. MUST be off in release
 # artifacts; CI asserts this. See docs/SPEC.md 7.3.

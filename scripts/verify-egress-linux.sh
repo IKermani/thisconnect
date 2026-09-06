@@ -72,6 +72,7 @@ LIVE_TUN_IP=""
 CONFIRMED="no"
 SELF_TEST="no"
 NETNS="no"
+WATCHER="no"
 
 WORK_DIR=""
 PROBE_BIN=""
@@ -101,6 +102,11 @@ Options:
   --netns              Run inside a private user+network namespace. Needs no root, touches
                        no host networking, and manufactures the escape device that makes the
                        backstop assertion conclusive. Incompatible with --egress-check.
+  --watcher            Prove the netlink watcher re-asserts policy deleted out from under a
+                       live session (SPEC.md §5.2). Builds the daemon's ignored watcher test
+                       and runs it in a private user+network namespace; needs no root. The
+                       test carries its own control and reports INCONCLUSIVE if the namespace
+                       cannot demonstrate the leak. Implies --netns; ignores --family.
   --family v4|v6|both  Which families to exercise (default both).
   --dev NAME           Throwaway tun name (default tc-verify0).
   --tun-ip ADDR        IPv4 address for the throwaway tun (default 10.255.255.2).
@@ -129,6 +135,7 @@ parse_args() {
       --confirm) CONFIRMED="yes" ;;
       --self-test) SELF_TEST="yes" ;;
       --netns) NETNS="yes" ;;
+      --watcher) WATCHER="yes" ;;
       --family)
         require_value "$@"
         FAMILIES="$(parse_family "$2")" || die "unknown family: $2 (want v4, v6 or both)"
@@ -330,6 +337,25 @@ evaluate_egress_verdict() {
     return 0
   fi
   echo "PASS exit address $tunnel differs from the direct address ${direct:-unknown}"
+}
+
+# A filter matching nothing exits 0 on some cargo versions, which would report PASS having
+# run nothing. "0 passed" alone does not distinguish that from a genuine pass, so this also
+# demands the filtered test actually ran.
+#
+# evaluate_watcher_verdict <rc> <output> -> "PASS ..." | "FAIL ..."
+evaluate_watcher_verdict() {
+  local rc="$1" output="$2"
+  if [ "$rc" -ne 0 ]; then
+    echo "FAIL see the test output above; an INCONCLUSIVE control reports there too"
+    return 0
+  fi
+  if printf '%s\n' "$output" | grep -q "test result: ok" &&
+    printf '%s\n' "$output" | grep -qE "running 1 test|test .*the_watcher_restores.* \.\.\. ok"; then
+    echo "PASS the watcher restored both rules and the lookup stayed on the tun"
+    return 0
+  fi
+  echo "FAIL the run reported success but the watcher test never ran (filter matched nothing); see the output above"
 }
 
 # ---------------------------------------------------------------------------
@@ -666,6 +692,29 @@ run_egress_test() {
   EGRESS_VERDICT="$(evaluate_egress_verdict "$direct" "$tunnel")"
 }
 
+# The watcher lives in the daemon, so this mode delegates to the daemon's own ignored test
+# rather than re-implementing re-assertion in shell. The build happens OUTSIDE the namespace so
+# a compile error is reported as a compile error, not as a namespace failure.
+run_watcher_test() {
+  step "Test: the netlink watcher re-asserts policy deleted mid-session"
+  command -v cargo >/dev/null || die "--watcher needs cargo"
+  command -v unshare >/dev/null || die "--watcher needs util-linux's unshare(1)"
+  command -v timeout >/dev/null || die "--watcher needs coreutils' timeout(1)"
+  say "Building the daemon test binary (outside the namespace)"
+  cargo test -p thisconnect-daemon --bin thisconnectd --no-run ||
+    die "the daemon test binary does not build"
+  say "Running the watcher test inside a private user+network namespace"
+  # The test has a 10s internal deadline, but a cold `cargo test` build inside the namespace can
+  # be slow; 300s is generous enough not to be a false FAIL but finite enough that a deadlock in
+  # the code under test resolves to FAIL instead of hanging the whole verification run forever.
+  local output rc=0
+  output="$(timeout 300 unshare --user --map-root-user --net -- \
+    cargo test -p thisconnect-daemon --bin thisconnectd -- \
+    --ignored --nocapture --test-threads=1 the_watcher_restores 2>&1)" || rc=$?
+  printf '%s\n' "$output"
+  WATCHER_VERDICT="$(evaluate_watcher_verdict "$rc" "$output")"
+}
+
 print_plan() {
   local family
   say "This run will, as root${NETNS:+ (inside a private network namespace)}:"
@@ -719,6 +768,7 @@ enter_netns() {
 FLOOR_VERDICTS=()
 RULE_VERDICTS=()
 EGRESS_VERDICT=""
+WATCHER_VERDICT=""
 
 print_verdict() {
   local line all=""
@@ -735,6 +785,10 @@ print_verdict() {
     say "test 2 egress: $EGRESS_VERDICT"
     all="$all$EGRESS_VERDICT"
   fi
+  if [ -n "$WATCHER_VERDICT" ]; then
+    say "netlink watcher: $WATCHER_VERDICT"
+    all="$all$WATCHER_VERDICT"
+  fi
 
   case "$all" in
     *FAIL*)
@@ -743,6 +797,8 @@ print_verdict() {
       say "A floor-route failure means a dropped tunnel route lets sockets escape or return an"
       say "errno the SOCKS5 layer cannot map. A rule failure means the netlink watcher in §5.2"
       say "is load-bearing rather than defence in depth, and teardown order must be re-derived."
+      say "A netlink watcher failure means policy deleted mid-session is not re-asserted, so"
+      say "§5.2's re-assertion latency is unbounded and the Linux leak window is open again."
       return 1
       ;;
     *INCONCLUSIVE*)
@@ -770,6 +826,11 @@ main() {
   fi
   if [ "$NETNS" = "yes" ] && [ -z "${TC_VERIFY_IN_NETNS:-}" ]; then
     enter_netns "$@"
+  fi
+  if [ "$WATCHER" = "yes" ]; then
+    run_watcher_test
+    print_verdict
+    return
   fi
 
   preflight
@@ -926,6 +987,63 @@ test_egress_passes_when_exit_address_differs() {
     "$(evaluate_egress_verdict "203.0.113.7" "198.51.100.4")"
 }
 
+test_watcher_passes_on_a_real_run() {
+  local output
+  output="$(cat <<'CARGO_OUT'
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.08s
+     Running unittests src/main.rs (target/debug/deps/thisconnectd-b3635e9d57920f49)
+
+running 1 test
+test session::watchdog::tests::the_watcher_restores_rules_deleted_under_a_live_session ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 412 filtered out; finished in 0.13s
+CARGO_OUT
+)"
+  check_prefix "watcher_passes_on_a_real_run" "PASS" "$(evaluate_watcher_verdict 0 "$output")"
+}
+
+# The silent-pass case this whole helper exists to catch: a filter matching nothing exits 0 on
+# some cargo versions, and "0 passed; 0 failed" alone looks superficially like success.
+test_watcher_fails_when_the_filter_matched_nothing() {
+  local output
+  output="$(cat <<'CARGO_OUT'
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s
+     Running unittests src/main.rs (target/debug/deps/thisconnectd-b3635e9d57920f49)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 413 filtered out; finished in 0.00s
+CARGO_OUT
+)"
+  check_prefix "watcher_fails_when_the_filter_matched_nothing" "FAIL the run reported success but the watcher test never ran" \
+    "$(evaluate_watcher_verdict 0 "$output")"
+}
+
+test_watcher_fails_on_a_nonzero_exit() {
+  local output
+  output="$(cat <<'CARGO_OUT'
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.09s
+     Running unittests src/main.rs (target/debug/deps/thisconnectd-b3635e9d57920f49)
+
+running 1 test
+test session::watchdog::tests::the_watcher_restores_rules_deleted_under_a_live_session ... FAILED
+
+failures:
+
+---- session::watchdog::tests::the_watcher_restores_rules_deleted_under_a_live_session stdout ----
+thread 'session::watchdog::tests::the_watcher_restores_rules_deleted_under_a_live_session' panicked at daemon/src/session/watchdog.rs:303:
+INCONCLUSIVE: the namespace could not demonstrate the leak
+
+failures:
+    session::watchdog::tests::the_watcher_restores_rules_deleted_under_a_live_session
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 412 filtered out; finished in 0.14s
+CARGO_OUT
+)"
+  check_prefix "watcher_fails_on_a_nonzero_exit" "FAIL see the test output above" \
+    "$(evaluate_watcher_verdict 1 "$output")"
+}
+
 test_labels_known_errnos() {
   check_eq "labels_known_errnos" "EHOSTUNREACH(113)" "$(errno_label "$RC_EHOSTUNREACH")"
 }
@@ -963,6 +1081,9 @@ run_self_test() {
   test_egress_fails_when_addresses_match
   test_egress_fails_when_tunnel_request_returned_nothing
   test_egress_passes_when_exit_address_differs
+  test_watcher_passes_on_a_real_run
+  test_watcher_fails_when_the_filter_matched_nothing
+  test_watcher_fails_on_a_nonzero_exit
   test_labels_known_errnos
   test_family_words_map_to_families
   test_family_selectors_differ_by_family

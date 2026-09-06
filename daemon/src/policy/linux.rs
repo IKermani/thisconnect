@@ -6,8 +6,9 @@
 //! Debian 13 and Fedora 41 (iproute2 6.1.0 through 6.15.0), and end to end against a real server
 //! by `scripts/verify-live-tunnel.sh`. The v6 steps below are verified against a synthetic tun;
 //! no *live* tunnel has ever carried v6, so the pushed-`ifconfig-ipv6` path into these steps is
-//! still untested. Nothing re-asserts any of this after install — see the netlink watcher in
-//! SPEC.md §5.2, which is specified and not implemented.
+//! still untested. `session::watchdog` re-asserts all of this whenever netlink reports a
+//! deletion, so a rule removed by NetworkManager or another VPN client comes back rather than
+//! leaking until the daemon restarts (SPEC.md §5.2).
 //!
 //! Three details are load-bearing and must not be "simplified":
 //!

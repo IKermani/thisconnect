@@ -234,6 +234,30 @@ async fn reconcile_startup_state(session: &SessionManager) {
     }
 }
 
+/// Something else deleting our policy mid-session was observed to leak (SPEC.md §5.2), and
+/// nothing put it back until the daemon restarted. A daemon that cannot open the netlink socket
+/// still runs — the policy is installed and fail-closed either way — but it has lost its only
+/// bound on how long a deletion goes unnoticed, so this is a warning, not a debug line.
+#[cfg(target_os = "linux")]
+fn spawn_policy_watchdog(policy: Arc<dyn TunnelPolicyDriver>, shutdown: watch::Receiver<bool>) {
+    match policy::PolicyWatch::open() {
+        Ok(watch) => {
+            tokio::spawn(session::watchdog::run(watch, policy, shutdown));
+            info!("watching netlink for policy deletions");
+        }
+        Err(error) => warn!(
+            %error,
+            "no netlink watch: tunnel policy deleted by something else will not be re-asserted until reconnect"
+        ),
+    }
+}
+
+/// macOS needs the `PF_ROUTE` equivalent (SPEC.md §5.2); until then a deletion goes unnoticed,
+/// which is a smaller exposure there because a scoped route's absence makes the kernel refuse to
+/// fall back to the physical interface rather than silently using it.
+#[cfg(not(target_os = "linux"))]
+fn spawn_policy_watchdog(_policy: Arc<dyn TunnelPolicyDriver>, _shutdown: watch::Receiver<bool>) {}
+
 /// The proxy listener, attached to the tunnel lifecycle.
 /// The proxy worker the tunnel publishes to.
 ///
@@ -287,9 +311,10 @@ async fn main() -> Result<()> {
         &config.profile_dir,
     ));
     let proxy = proxy_publisher(&config);
+    let tunnel_policy = tunnel_policy()?;
     let deps = system_deps(
         &config,
-        tunnel_policy()?,
+        Arc::clone(&tunnel_policy),
         secrets,
         outbound.clone(),
         Arc::clone(&proxy),
@@ -300,6 +325,7 @@ async fn main() -> Result<()> {
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     signals::install(shutdown_tx).context("install signal handlers")?;
+    spawn_policy_watchdog(Arc::clone(&tunnel_policy), shutdown_rx.clone());
 
     info!(
         path = %path,

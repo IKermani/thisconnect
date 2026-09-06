@@ -21,6 +21,8 @@
 mod command;
 mod linux;
 mod macos;
+#[cfg(target_os = "linux")]
+mod netlink;
 mod plan;
 mod reconcile;
 mod types;
@@ -30,7 +32,9 @@ use std::net::IpAddr;
 pub use command::{Command, CommandOutput, CommandRunner, SystemRunner};
 pub use linux::LinuxPolicy;
 pub use macos::MacosPolicy;
-pub use plan::{Check, Plan, Step, StepKind};
+#[cfg(target_os = "linux")]
+pub use netlink::{PolicyWatch, Trigger, WatchError};
+pub use plan::{Check, Plan, Reassertion, Step, StepKind};
 pub use reconcile::ReconcileReport;
 pub use types::{
     DeviceName, Family, Mtu, RawTunnel, Topology, TunnelEndpoint, TunnelSpec, POLICY_TABLE,
@@ -85,6 +89,9 @@ pub enum PolicyError {
     #[error("tunnel policy is not implemented for this platform")]
     UnsupportedPlatform,
 }
+
+#[cfg(test)]
+pub(crate) use command::testing;
 
 /// One platform's tunnel policy, expressed as commands and read-back assertions.
 pub trait TunnelPolicy: Send + Sync {
@@ -179,6 +186,13 @@ impl<R: CommandRunner> PolicyManager<R> {
         self.installed
             .store(true, std::sync::atomic::Ordering::SeqCst);
         Ok(InstalledPolicy { spec, plan })
+    }
+
+    /// Restores whatever has been deleted out from under a live session. Distinct from
+    /// [`Self::reconcile`], which removes state a *dead* session left behind: this one puts back
+    /// state a live session still depends on, and the two must never be confused.
+    pub fn reassert(&self, installed: &InstalledPolicy) -> plan::Reassertion {
+        plan::reassert(&installed.plan, &self.runner)
     }
 
     /// Idempotent, and safe to call on a machine where the state is already gone.
