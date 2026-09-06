@@ -5,6 +5,7 @@
 mod commands;
 mod error;
 mod ipc_client;
+mod tray;
 
 use tauri::{Emitter, Manager};
 
@@ -57,6 +58,7 @@ pub fn run() {
             let sink = AppHandleSink(app.handle().clone());
             let client = ipc_client::spawn(sink, ipc_client::socket_path());
             app.manage(client);
+            tray::setup(app)?;
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

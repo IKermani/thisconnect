@@ -1,12 +1,15 @@
 <script lang="ts">
   // SPDX-License-Identifier: GPL-3.0-or-later
   import { onMount } from 'svelte';
+  import { listen } from '@tauri-apps/api/event';
   import PromptDialog from './lib/components/PromptDialog.svelte';
+  import { connect, disconnect } from './lib/ipc';
   import { initConnectionStore } from './lib/stores/connection';
   import { initLogStore } from './lib/stores/log';
   import { initPromptStore } from './lib/stores/prompts';
   import { initProxyStore } from './lib/stores/proxy';
   import { refreshProfiles } from './lib/stores/profiles';
+  import { selectedProfileId } from './lib/stores/selection';
   import Connect from './routes/Connect.svelte';
   import Profiles from './routes/Profiles.svelte';
   import ProxyInfo from './routes/ProxyInfo.svelte';
@@ -20,6 +23,15 @@
     await Promise.all([initConnectionStore(), initLogStore(), initPromptStore()]);
     initProxyStore();
     await refreshProfiles();
+
+    await listen('tray-connect-requested', () => {
+      let id: string | null = null;
+      selectedProfileId.subscribe((v) => (id = v))();
+      if (id !== null) void connect(id);
+    });
+    await listen('tray-disconnect-requested', () => {
+      void disconnect();
+    });
   });
 </script>
 
