@@ -340,15 +340,28 @@ Mirrored for IPv6 when the tun has a v6 address; otherwise the proxy refuses `AF
   survive), that asymmetry made startup reconciliation fail on every clean machine. That one
   stderr is matched and read as empty; every other failure stays fatal.
 
-- **Netlink watcher — specified, NOT IMPLEMENTED [U].** Watch `RTM_NEWRULE`, `RTM_DELRULE`,
-  `RTM_DELROUTE`, `RTM_DELADDR` and re-assert. NetworkManager, systemd-networkd, and other VPN
-  clients rewrite policy routing; Tailscale issue #2325 documents rules being discarded on
-  connectivity changes. **Nothing in `daemon/` opens a netlink socket today.**
-  `PolicyManager::reconcile` is the only reconciliation that exists, it runs exactly once from
-  `main`, and it *removes* stale state rather than re-asserting live state. The re-assertion
-  latency asked about above is therefore unbounded: delete both rules mid-session and the tun
-  source address leaks to table `main` and keeps leaking until the daemon is restarted. Since
-  deleting both rules was *observed* to leak, this is a Linux release blocker, not hardening.
+- **Netlink watcher — implemented and verified on Linux [V].** `daemon/src/policy/netlink.rs`
+  joins `RTNLGRP_IPV4_RULE`, `RTNLGRP_IPV6_RULE`, `RTNLGRP_IPV4_ROUTE`, `RTNLGRP_IPV6_ROUTE`,
+  `RTNLGRP_IPV4_IFADDR` and `RTNLGRP_IPV6_IFADDR` on one `AF_NETLINK` socket and reports any
+  `RTM_DELRULE`/`RTM_DELROUTE`/`RTM_DELADDR` as an edge trigger. It reads `nlmsg_type` out of the
+  fixed header and nothing else: what decides whether the policy still stands is
+  `plan::reassert`, which re-runs the same read-back `Check`s that verified the install, walking
+  the plan **forward** so the backstop and floor are restored before the rule. No netlink crate
+  is used and no dependency was added.
+- **The re-assertion latency is now bounded and measured [V].** With both rules deleted out from
+  under a live session inside a private user+network namespace, the watcher restored them and the
+  lookup for the tun source address stayed on the tun. The assertion carries a control: the same
+  deletion with no watcher running must first be *seen* to send the address out over a dummy
+  device, or the run reports INCONCLUSIVE rather than passing. Driven by
+  `scripts/verify-egress-linux.sh --watcher`.
+- **A step that cannot be restored is reported, not escalated.** If the tun device is gone the
+  tunnel route can never come back; the floor and the backstop do not depend on it, so egress
+  answers `EHOSTUNREACH`/`ENETUNREACH` and the posture degrades toward more refusal. The daemon
+  logs and changes nothing else.
+- **macOS `PF_ROUTE` — still specified, NOT IMPLEMENTED [U].** Scoped routes deleted out from
+  under a live session are not re-asserted. The exposure is smaller than the Linux one was,
+  because the kernel refuses to fall back to the physical interface rather than silently using
+  it, but stale-route reconciliation on daemon start remains the only defence.
 - **Teardown order:** stop listener → kill live sessions → remove tunnel route → remove rule →
   remove floor → remove backstop. The backstop is removed last, and only after the rule is confirmed
   gone; it is the outermost layer, so it is installed first and torn down last. Every intermediate

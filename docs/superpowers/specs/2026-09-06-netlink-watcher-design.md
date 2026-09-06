@@ -100,8 +100,7 @@ large `SO_RCVBUF` and the pessimistic path.
 ### 2. `plan::reassert` — the response
 
 ```rust
-pub fn reassert(plan: &Plan, runner: &dyn CommandRunner)
-    -> Result<Vec<StepKind>, PolicyError>;
+pub fn reassert(plan: &Plan, runner: &dyn CommandRunner) -> Reassertion;
 ```
 
 Walks `plan.steps()` in **plan order, ascending**. For each step: evaluate `after_apply`; if
@@ -160,8 +159,9 @@ state unrepresentable instead of merely unreached.
 
 ### 5. Wiring
 
-A `PolicyWatchdog` task starts after `install` returns a verified `InstalledPolicy` and is
-aborted at `teardown`. It re-asserts on:
+A `PolicyWatchdog` task runs for the daemon's whole lifetime, not per-session. `reassert` is a
+no-op while nothing is installed, which removes the start/abort race against `install` and
+`teardown` rather than managing it. It re-asserts on:
 
 - any `Trigger::Deletion`, after draining whatever else is already queued so a burst
   coalesces into one pass;
@@ -185,7 +185,10 @@ Unit tests do not settle anything platform-specific here, and an assertion that 
 same with the watcher absent settles less than nothing — that was the vacuous-backstop finding
 of the previous session.
 
-`daemon/tests/netlink_watcher.rs`, `#[ignore]`d, requires `CAP_NET_ADMIN`.
+`daemon/Cargo.toml` declares only a `[[bin]]`, no `lib.rs`, so an integration test under
+`daemon/tests/` would have no crate to import. The `#[ignore]`d test that requires
+`CAP_NET_ADMIN` therefore lives in `daemon/src/session/watchdog.rs` and runs via
+`cargo test -p thisconnect-daemon --bin thisconnectd -- --ignored`.
 `scripts/verify-egress-linux.sh --watcher` runs it inside `unshare --user --map-root-user
 --net`, which grants `CAP_NET_ADMIN` without root and touches no host networking.
 
