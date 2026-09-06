@@ -978,15 +978,21 @@ for.** Publish reproducible builds and checksums early so "verify it yourself" i
 
 ## 13. Open questions
 
-1. **Nothing on macOS.** §10 tests 1 and 2 both passed against a real server; the macOS half of the
-   design is verified rather than argued.
-2. **Linux, mostly closed — one blocker left.** §5.2's routing half runs on both families and on
-   four iproute2 versions (§10 test 3), the `ip rule del lookup 218` selector form, the `mtu`
-   argument on `ip route add`, and the exact `ip rule show` substrings the verification matches on
-   were all confirmed directly, and `scripts/verify-live-tunnel.sh` passed end to end on Ubuntu
-   24.04 / openvpn 2.6.19 with all seven assertions green. **The blocker is the netlink watcher
-   (§5.2): it is specified and not implemented.** Nothing re-asserts the rule or the backstop
-   after install, so a third party deleting both leaks until the daemon restarts.
+1. **~~Nothing on macOS.~~ Closed.** §10 tests 1 and 2 both passed against a real server, and the
+   §5.2 netlink-watcher blocker below is now closed on macOS too: `daemon/src/policy/route_socket.rs`
+   re-asserts a scoped default route deleted out from under a live session, verified end to end
+   against a real throwaway utun with a control proving nothing but the watcher puts the route
+   back. `RTM_DELADDR` stays `[U]` — watched in code, never empirically triggered by an address
+   deletion — and a `RTM_VERSION` bump on a future Darwin would silently degrade detection to the
+   30-second sweep, with nothing louder than that SPEC line to say so.
+2. **Linux, closed.** §5.2's routing half runs on both families and on four iproute2 versions
+   (§10 test 3), the `ip rule del lookup 218` selector form, the `mtu` argument on `ip route add`,
+   and the exact `ip rule show` substrings the verification matches on were all confirmed directly,
+   and `scripts/verify-live-tunnel.sh` passed end to end on Ubuntu 24.04 / openvpn 2.6.19 with all
+   seven assertions green. **The netlink watcher (§5.2) is implemented and verified `[V]`**: a
+   rule or backstop deleted mid-session is now re-asserted from an `AF_NETLINK` edge trigger,
+   proven in a network namespace with a control requiring the address to be *seen* escaping before
+   the run counts as conclusive.
 
    Still open below that: a *live dual-stack tunnel*. The v6 policy is now executed against a
    synthetic tun, but no run has ever carried real v6 traffic, so §5.5's happy-eyeballs path and
