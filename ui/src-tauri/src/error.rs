@@ -1,11 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Error surface crossing the Tauri command boundary (design doc §5).
-//!
-//! Nothing in this crate wires this module's public API into the Tauri command
-//! layer yet (that's Task 5), so the error types are otherwise-unreachable
-//! from outside themselves; `dead_code` is suppressed accordingly until that
-//! wiring lands.
-#![allow(dead_code)]
 
 use serde::Serialize;
 use thisconnect_shared::ipc::{IpcError, Response};
@@ -19,8 +13,33 @@ use crate::ipc_client::IpcClientError;
 #[serde(into = "UiErrorWire")]
 pub enum UiError {
     Daemon(IpcError),
+    DaemonUnreachable { reason: UiUnreachableReason },
     Timeout,
     Internal { message: String },
+}
+
+// Tagged on "reason", not "type": this mirrors the hand-built JSON that
+// `lib.rs`'s `reason_to_json` already emits for the `connection-lost` event
+// (`{"reason": "not_running"}`, etc). The frontend's `DaemonUnreachableReason`
+// type is shared between that push path and this pull path, so both need the
+// identical wire shape.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "reason", rename_all = "snake_case")]
+pub enum UiUnreachableReason {
+    NotRunning,
+    PermissionDenied,
+    ProtocolMismatch { daemon_version: String },
+}
+
+impl From<crate::ipc_client::DaemonUnreachableReason> for UiUnreachableReason {
+    fn from(reason: crate::ipc_client::DaemonUnreachableReason) -> Self {
+        use crate::ipc_client::DaemonUnreachableReason as R;
+        match reason {
+            R::NotRunning => Self::NotRunning,
+            R::PermissionDenied => Self::PermissionDenied,
+            R::ProtocolMismatch { daemon_version } => Self::ProtocolMismatch { daemon_version },
+        }
+    }
 }
 
 // `IpcError`'s own fields (`code`, `message`, `validation`) need to appear
@@ -34,6 +53,9 @@ enum UiErrorWire {
         #[serde(flatten)]
         error: IpcError,
     },
+    DaemonUnreachable {
+        reason: UiUnreachableReason,
+    },
     Timeout,
     Internal {
         message: String,
@@ -44,6 +66,7 @@ impl From<UiError> for UiErrorWire {
     fn from(err: UiError) -> Self {
         match err {
             UiError::Daemon(error) => UiErrorWire::Daemon { error },
+            UiError::DaemonUnreachable { reason } => UiErrorWire::DaemonUnreachable { reason },
             UiError::Timeout => UiErrorWire::Timeout,
             UiError::Internal { message } => UiErrorWire::Internal { message },
         }

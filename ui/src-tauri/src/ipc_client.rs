@@ -3,12 +3,6 @@
 //! §7.4, design doc §3). Commands talk to it over an mpsc channel so exactly
 //! one write is ever in flight — mirroring the daemon's own management-
 //! protocol discipline (SPEC.md §4.3 point 2).
-//!
-//! Nothing in this crate wires the actor's public API into the Tauri command
-//! layer yet (that's a later task), so the module is otherwise-unreachable
-//! from outside itself; `dead_code` is suppressed accordingly until that
-//! wiring lands.
-#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -21,7 +15,7 @@ use thisconnect_shared::ipc::{
 };
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{debug, warn};
 
 pub const SOCKET_PATH_ENV: &str = "THISCONNECT_SOCKET";
@@ -41,6 +35,17 @@ pub enum DaemonUnreachableReason {
     NotRunning,
     PermissionDenied,
     ProtocolMismatch { daemon_version: String },
+}
+
+/// Last-known reachability, readable outside the push-event path via
+/// `IpcClientHandle::reachability` — a `watch` channel always holds its most
+/// recent value, so a late subscriber (e.g. a Tauri command called after the
+/// webview mounts) reads current state rather than missing an event emitted
+/// before it started listening.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Reachability {
+    Reachable,
+    Unreachable(DaemonUnreachableReason),
 }
 
 #[derive(Debug)]
@@ -103,6 +108,7 @@ enum ActorCommand {
 #[derive(Clone)]
 pub struct IpcClientHandle {
     tx: mpsc::UnboundedSender<ActorCommand>,
+    reachability: watch::Receiver<Reachability>,
 }
 
 impl IpcClientHandle {
@@ -128,6 +134,10 @@ impl IpcClientHandle {
             .send(ActorCommand::PromptReply { prompt_id, reply })
             .map_err(|_| IpcClientError::ActorGone)
     }
+
+    pub fn current_reachability(&self) -> Reachability {
+        self.reachability.borrow().clone()
+    }
 }
 
 // Uses `tauri::async_runtime::spawn`, not raw `tokio::spawn`: `Builder::setup`
@@ -137,20 +147,31 @@ impl IpcClientHandle {
 // (e.g. `#[tokio::test]`'s) when one is already active.
 pub fn spawn(sink: impl EventSink, path: PathBuf) -> IpcClientHandle {
     let (tx, rx) = mpsc::unbounded_channel();
-    tauri::async_runtime::spawn(run_actor(rx, sink, path));
-    IpcClientHandle { tx }
+    let (reach_tx, reach_rx) = watch::channel(Reachability::Reachable);
+    tauri::async_runtime::spawn(run_actor(rx, sink, path, reach_tx));
+    IpcClientHandle {
+        tx,
+        reachability: reach_rx,
+    }
 }
 
 async fn run_actor(
     mut rx: mpsc::UnboundedReceiver<ActorCommand>,
     sink: impl EventSink,
     path: PathBuf,
+    reach_tx: watch::Sender<Reachability>,
 ) {
-    match connect_and_serve(&mut rx, &sink, &path).await {
-        Ok(()) => {}
-        Err(reason) => {
-            warn!(?reason, "daemon connection ended");
-            sink.send(ActorEvent::ConnectionLost(reason));
+    let mut backoff = Duration::from_millis(250);
+    loop {
+        match connect_and_serve(&mut rx, &sink, &path, &reach_tx).await {
+            Ok(()) => return, // command channel closed: app is shutting down
+            Err(reason) => {
+                warn!(?reason, "daemon connection lost");
+                let _ = reach_tx.send(Reachability::Unreachable(reason.clone()));
+                sink.send(ActorEvent::ConnectionLost(reason));
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(5));
+            }
         }
     }
 }
@@ -205,6 +226,7 @@ async fn connect_and_serve(
     rx: &mut mpsc::UnboundedReceiver<ActorCommand>,
     sink: &impl EventSink,
     path: &PathBuf,
+    reach_tx: &watch::Sender<Reachability>,
 ) -> Result<(), DaemonUnreachableReason> {
     let stream = UnixStream::connect(path)
         .await
@@ -251,6 +273,7 @@ async fn connect_and_serve(
         }
     };
     debug!(daemon_version, "connected to thisconnectd");
+    let _ = reach_tx.send(Reachability::Reachable);
     sink.send(ActorEvent::ConnectionRestored);
 
     let mut pending: HashMap<RequestId, oneshot::Sender<Result<Response, IpcError>>> =
@@ -477,5 +500,78 @@ mod tests {
             event,
             ActorEvent::ConnectionLost(DaemonUnreachableReason::PermissionDenied)
         ));
+    }
+
+    #[tokio::test]
+    async fn reconnects_after_daemon_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("restart.sock");
+
+        // First daemon instance: handshake, then close the connection
+        // immediately — simulates a daemon restart from the actor's side.
+        let listener = UnixListener::bind(&path).expect("bind first fixture socket");
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("first accept");
+            let (read_half, mut write_half) = stream.into_split();
+            let mut reader = BufReader::new(read_half);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.expect("read hello");
+            let ClientMessage::Hello { id, .. } =
+                decode_line::<ClientMessage>(line.trim_end()).expect("decode hello")
+            else {
+                panic!("expected Hello first");
+            };
+            send_line(
+                &mut write_half,
+                &DaemonMessage::Hello {
+                    id,
+                    protocol_version: PROTOCOL_VERSION,
+                    daemon_version: "test-fixture".to_owned(),
+                },
+            )
+            .await
+            .expect("send hello reply");
+            // Both halves drop here, closing the socket right after the
+            // handshake.
+        });
+
+        let (sink_tx, mut sink_rx) = mpsc::unbounded_channel::<ActorEvent>();
+        let _handle = spawn(sink_tx, path.clone());
+
+        let restored = tokio::time::timeout(Duration::from_secs(2), sink_rx.recv())
+            .await
+            .expect("no timeout")
+            .expect("channel open");
+        assert!(matches!(restored, ActorEvent::ConnectionRestored));
+
+        let lost = tokio::time::timeout(Duration::from_secs(2), sink_rx.recv())
+            .await
+            .expect("no timeout")
+            .expect("channel open");
+        assert!(matches!(lost, ActorEvent::ConnectionLost(_)));
+
+        // `UnixListener` does not unlink its socket file on drop, and the
+        // actor will keep retrying the stale path in the meantime, so clear
+        // it before standing up the second fixture daemon.
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).expect("bind second fixture socket");
+        tokio::spawn(run_fixture_daemon(listener));
+
+        // The actor's backoff may emit further `ConnectionLost` events while
+        // the path is unoccupied; only a second `ConnectionRestored` proves
+        // it survives past one failure and reconnects, not just once.
+        let restored_again = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let ActorEvent::ConnectionRestored = sink_rx.recv().await.expect("channel open")
+                {
+                    return;
+                }
+            }
+        })
+        .await;
+        assert!(
+            restored_again.is_ok(),
+            "actor should reconnect after the daemon restarts"
+        );
     }
 }

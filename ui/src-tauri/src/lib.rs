@@ -72,6 +72,7 @@ pub fn run() {
             commands::proxy_info,
             commands::proxy_stats,
             commands::prompt_reply,
+            commands::reachability,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

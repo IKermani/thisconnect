@@ -9,10 +9,37 @@ use thisconnect_shared::ipc::{
 };
 
 use crate::error::{unexpected_response, UiError};
-use crate::ipc_client::{IpcClientError, IpcClientHandle};
+use crate::ipc_client::{IpcClientError, IpcClientHandle, Reachability};
 
 async fn call(client: &IpcClientHandle, request: Request) -> Result<Response, UiError> {
-    client.request(request).await.map_err(UiError::from)
+    match client.request(request).await {
+        Ok(response) => Ok(response),
+        Err(err) => match client.current_reachability() {
+            Reachability::Unreachable(reason) => Err(UiError::DaemonUnreachable {
+                reason: reason.into(),
+            }),
+            Reachability::Reachable => Err(UiError::from(err)),
+        },
+    }
+}
+
+#[derive(serde::Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ReachabilityWire {
+    Reachable,
+    Unreachable {
+        reason: crate::error::UiUnreachableReason,
+    },
+}
+
+#[tauri::command]
+pub fn reachability(client: State<'_, IpcClientHandle>) -> ReachabilityWire {
+    match client.current_reachability() {
+        Reachability::Reachable => ReachabilityWire::Reachable,
+        Reachability::Unreachable(reason) => ReachabilityWire::Unreachable {
+            reason: reason.into(),
+        },
+    }
 }
 
 #[tauri::command]
@@ -112,7 +139,12 @@ pub fn prompt_reply(
 ) -> Result<(), UiError> {
     client
         .prompt_reply(prompt_id, reply)
-        .map_err(|e: IpcClientError| UiError::from(e))
+        .map_err(|err: IpcClientError| match client.current_reachability() {
+            Reachability::Unreachable(reason) => UiError::DaemonUnreachable {
+                reason: reason.into(),
+            },
+            Reachability::Reachable => UiError::from(err),
+        })
 }
 
 #[cfg(test)]
