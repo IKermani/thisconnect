@@ -134,10 +134,18 @@ impl StateCell {
     }
 
     /// Claims the slot for teardown, returning the state it was in.
+    ///
+    /// `Failed` is accepted too, even though `is_busy()` excludes it: a failure
+    /// already owns the slot from the GUI's point of view (`ConnectionState`
+    /// isn't `Disconnected`), so without this a failed session has no way back
+    /// — `Connect` stays disabled and `Disconnect` returns `NotConnected`
+    /// forever. `disconnect()`'s own teardown is a no-op when nothing is left
+    /// to tear down, so this is safe regardless of whether the failure path
+    /// already cleared `active`.
     pub fn begin_disconnect(&self) -> Result<SessionState, SessionError> {
         let mut current = lock(&self.current);
         let previous = *current;
-        if !previous.is_busy() {
+        if !previous.is_busy() && previous != SessionState::Failed {
             return Err(SessionError::NotConnected);
         }
         if previous == SessionState::Disconnecting {
@@ -244,6 +252,24 @@ mod tests {
 
         // Act / Assert
         assert!(cell.begin_connect().is_ok());
+    }
+
+    /// A user who never retries a failed connect has no other way back to
+    /// `Disconnected` — `begin_disconnect()` must accept `Failed` as a starting
+    /// state, or the GUI is left with Connect disabled (state isn't
+    /// `disconnected`) and Disconnect permanently erroring `NotConnected`.
+    #[test]
+    fn allows_disconnecting_from_a_failed_state() {
+        // Arrange
+        let (cell, _rx) = cell();
+        cell.begin_connect().expect("connect");
+        cell.force(SessionState::Failed, Some("boom".to_owned()));
+
+        // Act
+        let previous = cell.begin_disconnect();
+
+        // Assert
+        assert!(matches!(previous, Ok(SessionState::Failed)));
     }
 
     #[test]
