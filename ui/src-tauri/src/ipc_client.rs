@@ -19,7 +19,7 @@ use thisconnect_shared::ipc::{
     DaemonMessage, Event, IpcError, PromptId, PromptReply, Request, RequestId, Response,
     PROTOCOL_VERSION,
 };
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, warn};
@@ -150,6 +150,52 @@ async fn run_actor(
     }
 }
 
+/// Accumulates bytes into complete lines. Cancel-safe by construction inside
+/// `tokio::select!`: `AsyncReadExt::read` either fully applies its result to
+/// `buf` or, if this future loses the select race, is dropped having read
+/// nothing — unlike `AsyncBufReadExt::read_line`, which can silently drop
+/// already-consumed bytes on cancellation. Same shape as
+/// `daemon/src/mgmt/codec.rs`'s `LineSplitter`, solving the same
+/// interleaved-command/event read problem (SPEC.md §4.3 point 2) on the GUI
+/// side of the same protocol.
+struct LineReader<R> {
+    inner: R,
+    buf: Vec<u8>,
+}
+
+impl<R: tokio::io::AsyncRead + Unpin> LineReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            buf: Vec::new(),
+        }
+    }
+
+    /// Returns the next complete line already buffered, without touching the
+    /// socket. Call this before `read_more` on every loop iteration — a
+    /// single `read_more` call can deliver more than one line's worth of
+    /// bytes, so this must be drained in a loop, not called once per read.
+    fn take_line(&mut self) -> Option<String> {
+        let pos = self.buf.iter().position(|&b| b == b'\n')?;
+        let mut line: Vec<u8> = self.buf.drain(..=pos).collect();
+        line.pop(); // trailing '\n'
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+        Some(String::from_utf8_lossy(&line).into_owned())
+    }
+
+    /// Reads more bytes into the buffer. Cancel-safe (see struct doc).
+    /// `Ok(0)` means EOF.
+    async fn read_more(&mut self) -> std::io::Result<usize> {
+        use tokio::io::AsyncReadExt;
+        let mut chunk = [0u8; 4096];
+        let n = self.inner.read(&mut chunk).await?;
+        self.buf.extend_from_slice(&chunk[..n]);
+        Ok(n)
+    }
+}
+
 async fn connect_and_serve(
     rx: &mut mpsc::UnboundedReceiver<ActorCommand>,
     sink: &impl EventSink,
@@ -159,7 +205,7 @@ async fn connect_and_serve(
         .await
         .map_err(classify_connect_error)?;
     let (read_half, mut write_half) = stream.into_split();
-    let mut reader = BufReader::new(read_half);
+    let mut reader = LineReader::new(read_half);
 
     let hello_id = RequestId(uuid::Uuid::new_v4().to_string());
     let hello = ClientMessage::Hello {
@@ -172,15 +218,20 @@ async fn connect_and_serve(
         .map_err(|_| DaemonUnreachableReason::NotRunning)?;
 
     let daemon_version = loop {
-        let mut line = String::new();
-        let bytes_read = reader
-            .read_line(&mut line)
-            .await
-            .map_err(|_| DaemonUnreachableReason::NotRunning)?;
-        if bytes_read == 0 {
-            return Err(DaemonUnreachableReason::NotRunning);
-        }
-        match decode_line::<DaemonMessage>(line.trim_end()) {
+        let line = match reader.take_line() {
+            Some(line) => line,
+            None => {
+                let bytes_read = reader
+                    .read_more()
+                    .await
+                    .map_err(|_| DaemonUnreachableReason::NotRunning)?;
+                if bytes_read == 0 {
+                    return Err(DaemonUnreachableReason::NotRunning);
+                }
+                continue;
+            }
+        };
+        match decode_line::<DaemonMessage>(&line) {
             Ok(DaemonMessage::Hello {
                 protocol_version,
                 daemon_version,
@@ -201,7 +252,9 @@ async fn connect_and_serve(
         HashMap::new();
 
     loop {
-        let mut line = String::new();
+        while let Some(line) = reader.take_line() {
+            handle_incoming(&line, sink, &mut pending);
+        }
         tokio::select! {
             cmd = rx.recv() => {
                 let Some(cmd) = cmd else { return Ok(()) };
@@ -209,12 +262,12 @@ async fn connect_and_serve(
                     return Err(DaemonUnreachableReason::NotRunning);
                 }
             }
-            read_result = reader.read_line(&mut line) => {
-                let bytes_read = read_result.map_err(|_| DaemonUnreachableReason::NotRunning)?;
-                if bytes_read == 0 {
-                    return Err(DaemonUnreachableReason::NotRunning);
+            read_result = reader.read_more() => {
+                match read_result {
+                    Ok(0) => return Err(DaemonUnreachableReason::NotRunning),
+                    Ok(_) => {}
+                    Err(_) => return Err(DaemonUnreachableReason::NotRunning),
                 }
-                handle_incoming(line.trim_end(), sink, &mut pending);
             }
         }
     }
@@ -299,6 +352,7 @@ async fn send_line<T: serde::Serialize>(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncBufReadExt, BufReader};
     use tokio::net::UnixListener;
 
     /// A fixture daemon: answers `Hello`, then echoes back `Response::Ack` for
