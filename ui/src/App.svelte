@@ -8,6 +8,10 @@
   import { initProxyStore } from './lib/stores/proxy';
   import { refreshProfiles } from './lib/stores/profiles';
   import Connect from './routes/Connect.svelte';
+  import Profiles from './routes/Profiles.svelte';
+
+  type Tab = 'connect' | 'profiles';
+  let activeTab = $state<Tab>('connect');
 
   onMount(async () => {
     await Promise.all([initConnectionStore(), initLogStore(), initPromptStore()]);
@@ -16,7 +20,20 @@
   });
 </script>
 
+<nav>
+  <button onclick={() => (activeTab = 'connect')} aria-current={activeTab === 'connect'}>
+    Connect
+  </button>
+  <button onclick={() => (activeTab = 'profiles')} aria-current={activeTab === 'profiles'}>
+    Profiles
+  </button>
+</nav>
+
 <main>
-  <Connect />
+  {#if activeTab === 'connect'}
+    <Connect />
+  {:else}
+    <Profiles />
+  {/if}
 </main>
 <PromptDialog />
