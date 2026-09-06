@@ -230,6 +230,58 @@ pub fn teardown(plan: &Plan, runner: &dyn CommandRunner) -> Result<(), PolicyErr
     Ok(())
 }
 
+/// What one re-assertion pass changed. `failed` is not an error: the floor and the backstop do
+/// not depend on the tun device, so a step that cannot come back leaves the address more
+/// refused, never less.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Reassertion {
+    pub restored: Vec<StepKind>,
+    pub failed: Vec<StepKind>,
+}
+
+impl Reassertion {
+    /// Nothing was missing. The overwhelmingly common outcome, and the one that must not log.
+    pub fn is_quiet(&self) -> bool {
+        self.restored.is_empty() && self.failed.is_empty()
+    }
+}
+
+/// Restores whatever has been deleted out from under a live session, in install order.
+///
+/// Walking `plan.steps()` forward is the same ordering invariant `Plan::new` enforces and
+/// `teardown` reverses, applied a third time: the backstop and the floor come back *before* the
+/// rule that routes the address into the table they protect. Restoring the rule first would
+/// reopen, however briefly, the fall-through to table `main` that this whole mechanism exists
+/// to prevent.
+///
+/// Every step is checked before it is touched, because `ip rule add` appends a duplicate rather
+/// than refusing — a blanket re-run of the plan would multiply rules, not restore them.
+pub fn reassert(plan: &Plan, runner: &dyn CommandRunner) -> Reassertion {
+    let mut outcome = Reassertion::default();
+    for step in plan.steps() {
+        let still_standing = step
+            .after_apply
+            .as_ref()
+            .is_some_and(|check| check.evaluate(runner).is_ok());
+        if still_standing {
+            continue;
+        }
+        match install_step(step, runner) {
+            Ok(()) => outcome.restored.push(step.kind),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    kind = ?step.kind,
+                    family = ?step.family,
+                    "could not re-assert tunnel policy; the fail-closed layers below it still stand"
+                );
+                outcome.failed.push(step.kind);
+            }
+        }
+    }
+    outcome
+}
+
 fn first_line(text: &str) -> String {
     text.lines().next().unwrap_or_default().trim().to_owned()
 }
@@ -498,5 +550,150 @@ mod tests {
             !runner.log().contains(&"/bin/policy do unfloor".to_owned()),
             "the floor must not be removed while the rule is still installed"
         );
+    }
+
+    #[test]
+    fn reassert_is_quiet_when_every_step_still_reads_back() {
+        let plan = full_plan();
+        // Every probe reports its own subject present, exactly as after a good install.
+        let runner = ScriptedRunner::new(|command| {
+            let rendered = command.to_string();
+            if rendered.contains("showfloor") {
+                ok("floor")
+            } else if rendered.contains("showrule") {
+                ok("rule")
+            } else if rendered.contains("showroute") {
+                ok("route")
+            } else {
+                ok("")
+            }
+        });
+
+        let outcome = reassert(&plan, &runner);
+
+        assert!(outcome.is_quiet());
+        // Only the three probes ran: a policy that is still standing must not be re-applied,
+        // because `ip rule add` appends a duplicate rather than refusing.
+        assert_eq!(runner.log().len(), 3);
+        assert!(!runner
+            .log()
+            .iter()
+            .any(|line| line == "/bin/policy do rule"));
+    }
+
+    #[test]
+    fn reassert_restores_a_deleted_step_and_leaves_the_others_alone() {
+        let plan = full_plan();
+        // The rule is gone; the floor and the route are not. Once re-applied it reads back.
+        let rule_restored = std::sync::atomic::AtomicBool::new(false);
+        let runner = ScriptedRunner::new(move |command| {
+            let rendered = command.to_string();
+            if rendered == "/bin/policy do rule" {
+                rule_restored.store(true, std::sync::atomic::Ordering::SeqCst);
+                return ok("");
+            }
+            if rendered.contains("showrule") {
+                return if rule_restored.load(std::sync::atomic::Ordering::SeqCst) {
+                    ok("rule")
+                } else {
+                    ok("")
+                };
+            }
+            if rendered.contains("showfloor") {
+                ok("floor")
+            } else if rendered.contains("showroute") {
+                ok("route")
+            } else {
+                ok("")
+            }
+        });
+
+        let outcome = reassert(&plan, &runner);
+
+        assert_eq!(outcome.restored, vec![StepKind::Rule]);
+        assert!(outcome.failed.is_empty());
+        assert!(runner
+            .log()
+            .iter()
+            .any(|line| line == "/bin/policy do rule"));
+        assert!(!runner
+            .log()
+            .iter()
+            .any(|line| line == "/bin/policy do floor"));
+    }
+
+    #[test]
+    fn reassert_restores_the_floor_before_the_rule_when_both_are_gone() {
+        // The window this whole change exists to close: with both gone, restoring the rule
+        // first would route the tun source address through a table that has no floor in it.
+        let plan = full_plan();
+        // Nothing ever reads back, so every step is treated as missing and re-applied.
+        let runner = ScriptedRunner::new(|_command| ok(""));
+
+        let outcome = reassert(&plan, &runner);
+
+        let log = runner.log();
+        let floor_at = log
+            .iter()
+            .position(|line| line == "/bin/policy do floor")
+            .expect("floor re-applied");
+        let rule_at = log
+            .iter()
+            .position(|line| line == "/bin/policy do rule")
+            .expect("rule re-applied");
+        let route_at = log
+            .iter()
+            .position(|line| line == "/bin/policy do route")
+            .expect("route re-applied");
+        assert!(
+            floor_at < rule_at,
+            "the floor must be restored before the rule"
+        );
+        assert!(
+            rule_at < route_at,
+            "the rule must be restored before the route"
+        );
+        // Re-applied but never read back, so none of them count as restored.
+        assert_eq!(outcome.restored, Vec::<StepKind>::new());
+        assert_eq!(
+            outcome.failed,
+            vec![StepKind::Floor, StepKind::Rule, StepKind::TunnelRoute]
+        );
+    }
+
+    #[test]
+    fn reassert_keeps_going_after_a_step_it_cannot_restore() {
+        // The tun device is gone, so the route can never come back. The floor and the rule
+        // are still standing, so re-assertion correctly leaves them untouched while the route
+        // it cannot restore is recorded as failed.
+        let plan = full_plan();
+        let runner = ScriptedRunner::new(|command| {
+            let rendered = command.to_string();
+            if rendered == "/bin/policy do route" {
+                return failed("Cannot find device \"tun0\"");
+            }
+            if rendered.contains("showroute") {
+                return ok("");
+            }
+            if rendered.contains("show") {
+                // Absent on the first look, present after the re-apply this test does not
+                // gate on; returning the subject makes the restore succeed.
+                let subject = if rendered.contains("showfloor") {
+                    "floor"
+                } else {
+                    "rule"
+                };
+                return ok(subject);
+            }
+            ok("")
+        });
+
+        let outcome = reassert(&plan, &runner);
+
+        assert_eq!(outcome.failed, vec![StepKind::TunnelRoute]);
+        assert!(runner
+            .log()
+            .iter()
+            .any(|line| line == "/bin/policy do route"));
     }
 }
