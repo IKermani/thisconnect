@@ -998,10 +998,11 @@ for.** Publish reproducible builds and checksums early so "verify it yourself" i
    synthetic tun, but no run has ever carried real v6 traffic, so §5.5's happy-eyeballs path and
    the pushed-`ifconfig-ipv6` parse remain unexercised end to end. That needs a v6-carrying
    profile.
-3. Linux distro matrix for §5.2 — Debian 12, Debian 13 and Fedora 41 now pass §10 test 3 on both
-   families, but as containers on the Ubuntu host's kernel. Kernel-level claims (RPF behaviour in
-   particular, which is argued from `__fib_validate_source()` rather than measured) still want a
-   real Fedora and Debian VM.
+3. **NEXT.** Linux distro matrix for §5.2 — Debian 12, Debian 13 and Fedora 41 now pass §10 test 3
+   on both families, but as containers on the Ubuntu host's kernel, which settles iproute2 and
+   packaging differences only. Kernel-level claims (RPF behaviour in particular, which is argued
+   from `__fib_validate_source()` rather than measured) still want a real Fedora and Debian VM,
+   not a container sharing this host's kernel.
 4. Whether to ship full-tunnel mode in v1.0 after all. It is what most users expect, and the daemon
    already has the privilege to do it.
 5. MTU handling. The observed utun MTU is 1240; tunnels commonly run 1300–1420. TCP relaying lets
