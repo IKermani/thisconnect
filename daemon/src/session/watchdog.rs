@@ -75,7 +75,7 @@ async fn drive_bounded(
             return;
         }
         if matches!(reason, Trigger::Desynchronised) {
-            warn!("netlink reported dropped messages; re-asserting tunnel policy unconditionally");
+            warn!("the policy watch reported dropped messages; re-asserting tunnel policy unconditionally");
         }
         report(reassert(&driver).await);
         // Coalesce whatever arrived while the probes were running, then hold the floor.
@@ -86,8 +86,8 @@ async fn drive_bounded(
 
 async fn reassert(driver: &Arc<dyn TunnelPolicyDriver>) -> Reassertion {
     let driver = Arc::clone(driver);
-    // The probes shell out to `ip`, which blocks. Running them on the async worker would stall
-    // the IPC server behind a routing change.
+    // The probes shell out to a blocking external command -- `ip` on Linux, `route` on macOS.
+    // Running them on the async worker would stall the IPC server behind a routing change.
     tokio::task::spawn_blocking(move || driver.reassert())
         .await
         .unwrap_or_default()

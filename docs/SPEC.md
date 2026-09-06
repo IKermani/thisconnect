@@ -375,6 +375,11 @@ Mirrored for IPv6 when the tun has a v6 address; otherwise the proxy refuses `AF
   the wake. If that message did not arrive, the loss would be bounded by the 30-second sweep
   rather than unbounded, and the tunnel route it protects cannot be restored once its device is
   gone in any case.
+- **A `RTM_VERSION` bump degrades detection to sweep-only, silently.** The walker stops at the
+  first message whose version it was not compiled against, rather than skipping it, because the
+  type byte's position is only guaranteed for the version it knows. The consequence is worth
+  stating plainly: on a future Darwin that bumps the version, deletions would go unnoticed by the
+  trigger and be caught only by the 30-second sweep, with nothing louder than that to say so.
 - **What the macOS watcher is for is availability, not leak prevention.** This is the one place
   the two platforms differ in kind. Deleting the Linux rules makes traffic *escape*; deleting the
   macOS scoped route makes the kernel refuse to fall back to the physical interface, so the tunnel
