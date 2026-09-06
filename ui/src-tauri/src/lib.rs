@@ -2,6 +2,8 @@
 //! Tauri application entry point (design doc `docs/superpowers/specs/2026-09-06-ui-design.md`,
 //! SPEC.md §3, §7.4).
 
+mod ipc_client;
+
 #[tauri::command]
 fn ping() -> &'static str {
     "pong"
