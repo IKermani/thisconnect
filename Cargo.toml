@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["shared", "daemon", "proxy"]
+members = ["shared", "daemon", "proxy", "ui/src-tauri"]
 
 [workspace.package]
 version = "0.1.0"
