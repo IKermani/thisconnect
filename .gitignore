@@ -35,3 +35,4 @@ Thumbs.db
 !/.env.example
 *.log
 /run/
+/.worktrees/
