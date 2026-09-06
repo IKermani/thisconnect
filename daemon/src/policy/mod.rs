@@ -21,6 +21,8 @@
 mod command;
 mod linux;
 mod macos;
+#[cfg(target_os = "linux")]
+mod netlink;
 mod plan;
 mod reconcile;
 mod types;
@@ -30,6 +32,8 @@ use std::net::IpAddr;
 pub use command::{Command, CommandOutput, CommandRunner, SystemRunner};
 pub use linux::LinuxPolicy;
 pub use macos::MacosPolicy;
+#[cfg(target_os = "linux")]
+pub use netlink::{PolicyWatch, Trigger, WatchError};
 pub use plan::{Check, Plan, Step, StepKind};
 pub use reconcile::ReconcileReport;
 pub use types::{
