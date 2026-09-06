@@ -16,6 +16,8 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 use tokio::io::unix::AsyncFd;
 
+use super::watch::Trigger;
+
 /// `sizeof(struct nlmsghdr)`: u32 len, u16 type, u16 flags, u32 seq, u32 pid.
 const NLMSG_HDRLEN: usize = 16;
 
@@ -39,16 +41,6 @@ const GROUPS: [libc::c_uint; 6] = [
     libc::RTNLGRP_IPV4_IFADDR,
     libc::RTNLGRP_IPV6_IFADDR,
 ];
-
-/// Why the watchdog woke up.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Trigger {
-    /// An `RTM_DEL*` arrived in a group we watch.
-    Deletion,
-    /// The kernel dropped messages (`ENOBUFS`) or the socket errored. We cannot know what was
-    /// missed, so the only safe reading is that it was the deletion we exist to catch.
-    Desynchronised,
-}
 
 fn nlmsg_align(len: usize) -> usize {
     (len + 3) & !3

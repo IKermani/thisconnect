@@ -235,27 +235,27 @@ async fn reconcile_startup_state(session: &SessionManager) {
 }
 
 /// Something else deleting our policy mid-session was observed to leak (SPEC.md §5.2), and
-/// nothing put it back until the daemon restarted. A daemon that cannot open the netlink socket
+/// nothing put it back until the daemon restarted. A daemon that cannot open the watch socket
 /// still runs — the policy is installed and fail-closed either way — but it has lost its only
 /// bound on how long a deletion goes unnoticed, so this is a warning, not a debug line.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn spawn_policy_watchdog(policy: Arc<dyn TunnelPolicyDriver>, shutdown: watch::Receiver<bool>) {
     match policy::PolicyWatch::open() {
         Ok(watch) => {
             tokio::spawn(session::watchdog::run(watch, policy, shutdown));
-            info!("watching netlink for policy deletions");
+            info!("watching the kernel routing socket for policy deletions");
         }
         Err(error) => warn!(
             %error,
-            "no netlink watch: tunnel policy deleted by something else will not be re-asserted until reconnect"
+            "no routing watch: tunnel policy deleted by something else will not be re-asserted until reconnect"
         ),
     }
 }
 
-/// macOS needs the `PF_ROUTE` equivalent (SPEC.md §5.2); until then a deletion goes unnoticed,
-/// which is a smaller exposure there because a scoped route's absence makes the kernel refuse to
-/// fall back to the physical interface rather than silently using it.
-#[cfg(not(target_os = "linux"))]
+/// No routing-socket backend exists for this platform, so a deletion goes unnoticed until the
+/// next connect. `platform_backend` already refuses to install policy here at all, so this stub
+/// exists to keep the call site unconditional rather than to support a real target.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn spawn_policy_watchdog(_policy: Arc<dyn TunnelPolicyDriver>, _shutdown: watch::Receiver<bool>) {}
 
 /// The proxy listener, attached to the tunnel lifecycle.
