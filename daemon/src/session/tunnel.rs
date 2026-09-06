@@ -16,8 +16,8 @@ use std::sync::Mutex;
 use tracing::warn;
 
 use crate::policy::{
-    CommandRunner, InstalledPolicy, PolicyError, PolicyManager, RawTunnel, ReconcileReport,
-    TunnelSpec,
+    CommandRunner, InstalledPolicy, PolicyError, PolicyManager, RawTunnel, Reassertion,
+    ReconcileReport, TunnelSpec,
 };
 
 /// The `>UPDOWN:ENV` block carries no MTU, so the profile's `tun-mtu` is used
@@ -85,6 +85,11 @@ pub trait TunnelPolicyDriver: Send + Sync {
     fn install(&self, spec: TunnelSpec, mtu: u32) -> Result<TunnelBinding, PolicyError>;
 
     fn teardown(&self, binding: &TunnelBinding) -> Result<(), PolicyError>;
+
+    /// Re-installs any policy step that has been removed since `install`. A no-op when nothing
+    /// is installed, which is what makes it safe to call from a watchdog that outlives any one
+    /// session.
+    fn reassert(&self) -> Reassertion;
 }
 
 /// The real driver. It keeps the [`InstalledPolicy`] proof that `install`
@@ -117,7 +122,13 @@ impl<R: CommandRunner> TunnelPolicyDriver for ManagedPolicy<R> {
     }
 
     fn teardown(&self, binding: &TunnelBinding) -> Result<(), PolicyError> {
-        let Some(installed) = lock(&self.installed).take() else {
+        // The guard is held across the whole teardown, not just the take(). It is the only thing
+        // serialising this against a re-assertion from the watchdog, which would otherwise start
+        // re-adding rules half way through their removal. Holding it also means "this session is
+        // going away" is expressed as the absence of the proof value rather than as a second flag
+        // that could disagree with it.
+        let mut guard = lock(&self.installed);
+        let Some(installed) = guard.take() else {
             // Already removed, or this daemon never installed it. Teardown is
             // idempotent by contract, so this is not an error.
             return Ok(());
@@ -130,6 +141,14 @@ impl<R: CommandRunner> TunnelPolicyDriver for ManagedPolicy<R> {
             );
         }
         self.manager.teardown(&installed)
+    }
+
+    fn reassert(&self) -> Reassertion {
+        let installed = lock(&self.installed);
+        installed
+            .as_ref()
+            .map(|installed| self.manager.reassert(installed))
+            .unwrap_or_default()
     }
 }
 
@@ -323,6 +342,10 @@ pub(crate) mod testing {
             self.teardowns.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
+
+        fn reassert(&self) -> Reassertion {
+            Reassertion::default()
+        }
     }
 
     #[derive(Default)]
@@ -374,7 +397,153 @@ pub(crate) mod testing {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+    use crate::policy::testing::ScriptedRunner;
+    use crate::policy::{Command, CommandOutput, LinuxPolicy, RawTunnel};
+
     use super::*;
+
+    fn spec() -> TunnelSpec {
+        TunnelSpec::parse(RawTunnel {
+            device: "tun0",
+            local_v4: "10.8.0.2",
+            gateway_v4: Some("10.8.0.1"),
+            local_v6: Some("fd00::2"),
+            gateway_v6: None,
+            mtu: 1400,
+        })
+        .expect("valid spec")
+    }
+
+    fn everything_installed(command: &Command) -> CommandOutput {
+        let rendered = command.to_string();
+        if rendered.ends_with("route show table 218") {
+            crate::policy::testing::ok(
+                "unreachable default metric 4000\ndefault dev tun0 src 10.8.0.2 metric 100 mtu 1400\n",
+            )
+        } else if rendered.ends_with("rule show") {
+            crate::policy::testing::ok(
+                "18500:\tfrom 10.8.0.2 unreachable\n18500:\tfrom fd00::2 unreachable\n\
+                18000:\tfrom 10.8.0.2 lookup 218\n18000:\tfrom fd00::2 lookup 218\n",
+            )
+        } else {
+            crate::policy::testing::ok("")
+        }
+    }
+
+    fn managed_driver<F>(reply: F) -> ManagedPolicy<ScriptedRunner<F>>
+    where
+        F: Fn(&Command) -> CommandOutput + Send + Sync,
+    {
+        ManagedPolicy::new(PolicyManager::new(
+            Box::new(LinuxPolicy::with_ip_binary("/usr/sbin/ip")),
+            ScriptedRunner::new(reply),
+        ))
+    }
+
+    #[test]
+    fn reassert_does_nothing_before_an_install_and_after_a_teardown() {
+        // The liveness signal is the InstalledPolicy itself. A watchdog that ran against a
+        // torn-down session would re-install the rule and the table the proxy no longer pins
+        // sockets to — reconciliation's job, done at the worst possible moment.
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // `everything_installed` alone cannot answer a real teardown: it always reports the
+        // policy present, which fails every after-undo check. Once the first removal command
+        // runs, later read-backs must report the policy gone, exactly as a real `ip` would.
+        let tearing_down = AtomicBool::new(false);
+        let driver = managed_driver(move |command: &Command| {
+            if command.to_string().contains("route del default dev") {
+                tearing_down.store(true, Ordering::SeqCst);
+            }
+            if tearing_down.load(Ordering::SeqCst) {
+                crate::policy::testing::ok("")
+            } else {
+                everything_installed(command)
+            }
+        });
+
+        assert!(driver.reassert().is_quiet());
+
+        let binding = driver.install(spec(), 1400).expect("installed");
+        driver.teardown(&binding).expect("torn down");
+
+        assert!(driver.reassert().is_quiet());
+    }
+
+    #[test]
+    fn teardown_holds_the_guard_so_a_concurrent_reassert_cannot_interleave() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        // Set once the racing thread's reassert() returns.
+        let reassert_returned = Arc::new(AtomicBool::new(false));
+        // Set while the runner is parked inside the first teardown command.
+        let inside_teardown = Arc::new(AtomicBool::new(false));
+
+        let driver = {
+            let inside = Arc::clone(&inside_teardown);
+            Arc::new(managed_driver(move |command: &Command| {
+                let rendered = command.to_string();
+                // Park inside teardown's first removal, holding the guard open for as long
+                // as a correct implementation would hold it: the whole teardown.
+                if rendered.contains("route del default dev") {
+                    inside.store(true, Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                }
+                // Once torn down is under way, every read-back must report the policy gone —
+                // otherwise teardown's own after-undo verification fails before it can finish.
+                if inside.load(Ordering::SeqCst) {
+                    crate::policy::testing::ok("")
+                } else {
+                    everything_installed(command)
+                }
+            }))
+        };
+
+        let binding = driver.install(spec(), 1400).expect("installed");
+
+        // Teardown runs on its own thread: the runner parks inside it for 300ms, and the main
+        // thread needs to observe that window from the outside rather than being the one blocked
+        // inside `teardown` itself.
+        let teardown_thread = {
+            let driver = Arc::clone(&driver);
+            let binding = binding.clone();
+            std::thread::spawn(move || driver.teardown(&binding))
+        };
+
+        let racer = {
+            let driver = Arc::clone(&driver);
+            let returned = Arc::clone(&reassert_returned);
+            let inside = Arc::clone(&inside_teardown);
+            std::thread::spawn(move || {
+                // Only start racing once teardown is demonstrably in flight.
+                while !inside.load(Ordering::SeqCst) {
+                    std::thread::yield_now();
+                }
+                driver.reassert();
+                returned.store(true, Ordering::SeqCst);
+            })
+        };
+
+        // Wait until the runner is parked, then check the racer is still blocked on the guard.
+        while !inside_teardown.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let returned_mid_teardown = reassert_returned.load(Ordering::SeqCst);
+
+        teardown_thread
+            .join()
+            .expect("teardown thread")
+            .expect("torn down");
+        racer.join().expect("racer");
+
+        assert!(
+            !returned_mid_teardown,
+            "a reassert completed while teardown was mid-flight: the guard is not held across \
+             teardown, so re-assertion can re-add rules that teardown is in the middle of removing"
+        );
+    }
 
     #[test]
     fn builds_a_spec_from_the_strings_openvpn_reported() {
