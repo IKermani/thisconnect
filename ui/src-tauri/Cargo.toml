@@ -27,6 +27,7 @@ uuid = { version = "1", features = ["v4"] }
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3"
+tauri = { version = "2", features = ["tray-icon", "test"] }
 
 [lints]
 workspace = true

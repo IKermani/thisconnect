@@ -130,9 +130,14 @@ impl IpcClientHandle {
     }
 }
 
+// Uses `tauri::async_runtime::spawn`, not raw `tokio::spawn`: `Builder::setup`
+// runs synchronously with no ambient Tokio reactor, and `tokio::spawn` panics
+// outside one ("there is no reactor running"). Tauri's wrapper lazily owns a
+// runtime for exactly this case, while still using the caller's runtime
+// (e.g. `#[tokio::test]`'s) when one is already active.
 pub fn spawn(sink: impl EventSink, path: PathBuf) -> IpcClientHandle {
     let (tx, rx) = mpsc::unbounded_channel();
-    tokio::spawn(run_actor(rx, sink, path));
+    tauri::async_runtime::spawn(run_actor(rx, sink, path));
     IpcClientHandle { tx }
 }
 
