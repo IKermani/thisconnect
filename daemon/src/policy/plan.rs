@@ -663,37 +663,51 @@ mod tests {
 
     #[test]
     fn reassert_keeps_going_after_a_step_it_cannot_restore() {
-        // The tun device is gone, so the route can never come back. The floor and the rule
-        // are still standing, so re-assertion correctly leaves them untouched while the route
-        // it cannot restore is recorded as failed.
+        // The rule sits in the middle of the plan and can never be restored, but the tunnel
+        // route after it still is: a failure partway through must not abandon the steps that
+        // follow. (The route step is last in `full_plan()`, so this is the only shape that can
+        // prove "keeps going" — a fail on the last step looks identical to an abort-on-error.)
         let plan = full_plan();
-        let runner = ScriptedRunner::new(|command| {
+        let route_applied = std::sync::atomic::AtomicBool::new(false);
+        let runner = ScriptedRunner::new(move |command| {
             let rendered = command.to_string();
-            if rendered == "/bin/policy do route" {
+            if rendered == "/bin/policy do rule" {
                 return failed("Cannot find device \"tun0\"");
             }
-            if rendered.contains("showroute") {
+            if rendered.contains("showfloor") {
+                // Still standing: must be skipped, never re-applied.
+                return ok("floor");
+            }
+            if rendered.contains("showrule") {
+                // Absent both before and after the failed re-apply attempt.
                 return ok("");
             }
-            if rendered.contains("show") {
-                // Absent on the first look, present after the re-apply this test does not
-                // gate on; returning the subject makes the restore succeed.
-                let subject = if rendered.contains("showfloor") {
-                    "floor"
+            if rendered == "/bin/policy do route" {
+                route_applied.store(true, std::sync::atomic::Ordering::SeqCst);
+                return ok("");
+            }
+            if rendered.contains("showroute") {
+                return if route_applied.load(std::sync::atomic::Ordering::SeqCst) {
+                    ok("route")
                 } else {
-                    "rule"
+                    ok("")
                 };
-                return ok(subject);
             }
             ok("")
         });
 
         let outcome = reassert(&plan, &runner);
 
-        assert_eq!(outcome.failed, vec![StepKind::TunnelRoute]);
+        assert_eq!(outcome.failed, vec![StepKind::Rule]);
+        // Pins "keeps going": a loop that aborts on the first error would leave this empty.
+        assert_eq!(outcome.restored, vec![StepKind::TunnelRoute]);
         assert!(runner
             .log()
             .iter()
             .any(|line| line == "/bin/policy do route"));
+        assert!(!runner
+            .log()
+            .iter()
+            .any(|line| line == "/bin/policy do floor"));
     }
 }
