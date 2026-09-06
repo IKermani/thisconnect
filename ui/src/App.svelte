@@ -10,8 +10,10 @@
   import Connect from './routes/Connect.svelte';
   import Profiles from './routes/Profiles.svelte';
   import ProxyInfo from './routes/ProxyInfo.svelte';
+  import Settings from './routes/Settings.svelte';
+  import Log from './routes/Log.svelte';
 
-  type Tab = 'connect' | 'profiles' | 'proxy';
+  type Tab = 'connect' | 'profiles' | 'proxy' | 'settings' | 'log';
   let activeTab = $state<Tab>('connect');
 
   onMount(async () => {
@@ -31,6 +33,12 @@
   <button onclick={() => (activeTab = 'proxy')} aria-current={activeTab === 'proxy'}>
     Proxy
   </button>
+  <button onclick={() => (activeTab = 'settings')} aria-current={activeTab === 'settings'}>
+    Settings
+  </button>
+  <button onclick={() => (activeTab = 'log')} aria-current={activeTab === 'log'}>
+    Log
+  </button>
 </nav>
 
 <main>
@@ -40,6 +48,10 @@
     <Profiles />
   {:else if activeTab === 'proxy'}
     <ProxyInfo />
+  {:else if activeTab === 'settings'}
+    <Settings />
+  {:else if activeTab === 'log'}
+    <Log />
   {/if}
 </main>
 <PromptDialog />
