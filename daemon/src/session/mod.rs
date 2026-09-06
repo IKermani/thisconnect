@@ -25,6 +25,8 @@ pub mod state;
 pub mod store;
 pub mod transport;
 pub mod tunnel;
+#[cfg(target_os = "linux")]
+pub mod watchdog;
 pub mod workspace;
 
 #[cfg(test)]
