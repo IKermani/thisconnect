@@ -1,16 +1,22 @@
 <script lang="ts">
   // SPDX-License-Identifier: GPL-3.0-or-later
-  import { invoke } from '@tauri-apps/api/core';
+  import { onMount } from 'svelte';
+  import PromptDialog from './lib/components/PromptDialog.svelte';
+  import { initConnectionStore } from './lib/stores/connection';
+  import { initLogStore } from './lib/stores/log';
+  import { initPromptStore } from './lib/stores/prompts';
+  import { initProxyStore } from './lib/stores/proxy';
+  import { refreshProfiles } from './lib/stores/profiles';
+  import Connect from './routes/Connect.svelte';
 
-  let pong = $state('');
-
-  async function testPing() {
-    pong = await invoke<string>('ping');
-  }
+  onMount(async () => {
+    await Promise.all([initConnectionStore(), initLogStore(), initPromptStore()]);
+    initProxyStore();
+    await refreshProfiles();
+  });
 </script>
 
 <main>
-  <h1>thisconnect</h1>
-  <button onclick={testPing}>ping</button>
-  {#if pong}<p>{pong}</p>{/if}
+  <Connect />
 </main>
+<PromptDialog />
