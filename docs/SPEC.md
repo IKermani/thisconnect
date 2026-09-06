@@ -295,6 +295,23 @@ ip route add default dev <tun> src <tunip> table 218 metric 100 mtu <tunmtu>
 
 Mirrored for IPv6 when the tun has a v6 address; otherwise the proxy refuses `AF_INET6` outright (§5.5).
 
+- **The v6 mirror is now executed, not just transcribed [V].** `scripts/verify-egress-linux.sh
+  --netns` runs the floor and backstop assertions for both families. The v6 half answers exactly
+  as the v4 half does — floor `EHOSTUNREACH(113)`, backstop `ENETUNREACH(101)` — and `ip -6 rule
+  show` renders the selectors the daemon's post-apply checks match on (`from <ip> lookup 218` and
+  `from <ip> unreachable`, both with the `/128` dropped, as v4 drops the `/32`).
+- **A v6 tun address must be added `nodad`.** The kernel keeps a fresh v6 address `tentative`
+  until duplicate-address detection finishes, and `bind()` on a tentative address fails
+  `EADDRNOTAVAIL`. IPv4 has no analogue. A verification run whose `bind()` failed proves nothing
+  about routing, so the harness asserts the address is non-tentative before believing any result.
+- **The backstop assertion needs a control.** On a host with no route for a family at all — the
+  normal state of IPv6 nearly everywhere — a working backstop and an absent one both answer
+  `ENETUNREACH`, so asserting the errno alone is a green tick for nothing. The test now removes
+  the backstop too and requires the source address to be *seen* escaping over another device
+  before it will call the backstop load-bearing. `--netns` manufactures that escape path from a
+  dummy device inside a private user+network namespace, which needs no root and touches no host
+  networking.
+
 - **`unreachable`, not `blackhole`.** `fib_props[]` in `net/ipv4/fib_semantics.c`: `RTN_BLACKHOLE`
   → `-EINVAL`, `RTN_UNREACHABLE` → `-EHOSTUNREACH` **[V]**. `EINVAL` from `connect()` is
   indistinguishable from a caller bug and maps to no SOCKS5 reply code; `EHOSTUNREACH` maps
@@ -323,9 +340,15 @@ Mirrored for IPv6 when the tun has a v6 address; otherwise the proxy refuses `AF
   survive), that asymmetry made startup reconciliation fail on every clean machine. That one
   stderr is matched and read as empty; every other failure stays fatal.
 
-- **Netlink watcher.** Watch `RTM_NEWRULE`, `RTM_DELRULE`, `RTM_DELROUTE`, `RTM_DELADDR` and
-  re-assert. NetworkManager, systemd-networkd, and other VPN clients rewrite policy routing;
-  Tailscale issue #2325 documents rules being discarded on connectivity changes.
+- **Netlink watcher — specified, NOT IMPLEMENTED [U].** Watch `RTM_NEWRULE`, `RTM_DELRULE`,
+  `RTM_DELROUTE`, `RTM_DELADDR` and re-assert. NetworkManager, systemd-networkd, and other VPN
+  clients rewrite policy routing; Tailscale issue #2325 documents rules being discarded on
+  connectivity changes. **Nothing in `daemon/` opens a netlink socket today.**
+  `PolicyManager::reconcile` is the only reconciliation that exists, it runs exactly once from
+  `main`, and it *removes* stale state rather than re-asserting live state. The re-assertion
+  latency asked about above is therefore unbounded: delete both rules mid-session and the tun
+  source address leaks to table `main` and keeps leaking until the daemon is restarted. Since
+  deleting both rules was *observed* to leak, this is a Linux release blocker, not hardening.
 - **Teardown order:** stop listener → kill live sessions → remove tunnel route → remove rule →
   remove floor → remove backstop. The backstop is removed last, and only after the rule is confirmed
   gone; it is the outermost layer, so it is installed first and torn down last. Every intermediate
@@ -817,22 +840,37 @@ claim, not a guarantee.
 
    Not covered: IPC peer authentication. The harness must build with `dev-insecure-ipc` because no
    shell script can present the GUI's code signature; §7.3 is covered by its own tests.
-3. **Fail-closed floor and backstop (Linux).** **[V]** With the tun IP **still present**, delete the
-   tunnel route from table 218 and assert `connect()` returns `EHOSTUNREACH` from the floor route.
-   This is the only test that exercises the floor. Separately, delete the `ip rule` and assert
-   failure rather than fall-through to `main`. Run under `sudo` on Ubuntu 24.04 / iproute2 6.1.0 by
-   `scripts/verify-egress-linux.sh`:
+3. **Fail-closed floor and backstop (Linux), both families.** **[V]** With the tun IP **still
+   present**, delete the tunnel route from table 218 and assert `connect()` returns
+   `EHOSTUNREACH` from the floor route. This is the only test that exercises the floor.
+   Separately, delete the `ip rule` and assert failure rather than fall-through to `main` — and
+   then delete the backstop too, and require the address to be *seen* escaping, or the previous
+   assertion proved nothing. `scripts/verify-egress-linux.sh`, run under `sudo` on the host and
+   with `--netns` (no root) elsewhere:
 
-   | Case | Result |
-   |---|---|
-   | Full policy installed, socket bound to the tun IP | `PENDING` — route lookup cleared, nothing answers |
-   | Tunnel route deleted, tun address still present | `EHOSTUNREACH(113)` — the floor, not a missing address |
-   | Policy rule deleted, **no backstop** | fell through to `main` via the physical link — **leak** |
-   | Policy rule deleted, backstop installed | `ENETUNREACH(101)` — fails closed |
-   | Default route, during and after | byte-for-byte unchanged, no residue |
+   | Case | IPv4 | IPv6 |
+   |---|---|---|
+   | Full policy installed, socket bound to the tun IP | `PENDING` — route lookup cleared, nothing answers | `PENDING` |
+   | Tunnel route deleted, tun address still present | `EHOSTUNREACH(113)` — the floor, not a missing address | `EHOSTUNREACH(113)` |
+   | Policy rule deleted, **no backstop** | fell through to `main` via the physical link — **leak** | fell through to the escape device — **leak** |
+   | Policy rule deleted, backstop installed | `ENETUNREACH(101)` — fails closed | `ENETUNREACH(101)` |
+   | Control: both rules deleted | escapes via another device, so the row above is load-bearing | escapes via another device |
+   | Default route, during and after | byte-for-byte unchanged, no residue | unchanged, no residue |
 
-   The third row is why the backstop exists; it was a real finding, not a hypothetical. The
-   remaining gap is a Debian stable and Fedora run.
+   The third row is why the backstop exists; it was a real finding, not a hypothetical. The fifth
+   row exists because without it the fourth is a green tick for nothing on any host that has no
+   route for that family — which is most hosts, for IPv6.
+
+   Distro coverage, every row green with the control proven, via `--netns`: Ubuntu 24.04 /
+   iproute2 6.1.0, Debian 12 bookworm / iproute2 6.1.0, Debian 13 trixie / iproute2 6.15.0,
+   Fedora 41 / iproute2 6.10.0. Nothing in the rendering or the errnos moved across a 6.1.0 →
+   6.15.0 span. Ubuntu 24.04 additionally passed the v4 half under `sudo` on the real host with
+   its real default route as the escape path.
+
+   What that does **not** cover: the Debian and Fedora runs were containers, so they share the
+   Ubuntu host's 6.17 kernel. They settle iproute2 version and distro packaging differences —
+   the proven source of trouble here — and say nothing about kernel differences. A Fedora VM on
+   a Fedora kernel is still worth doing.
 
 A tun-flap test is worth keeping but must be labelled honestly: it tests `bind()` returning
 `EADDRNOTAVAIL`, **not** the routing policy. It passes with no rule and no floor installed, which is
@@ -887,18 +925,22 @@ for.** Publish reproducible builds and checksums early so "verify it yourself" i
 
 1. **Nothing on macOS.** §10 tests 1 and 2 both passed against a real server; the macOS half of the
    design is verified rather than argued.
-2. **Linux, partially closed.** §5.2's routing half now runs: `scripts/verify-egress-linux.sh`
-   passed under `sudo` on Ubuntu 24.04 / iproute2 6.1.0, and the `ip rule del lookup 218` selector
-   form, the `mtu` argument on `ip route add`, and the exact `ip rule show` substring the
-   verification matches on (`from <ip> lookup 218`, rendered without the `/32`) were all confirmed
-   directly. `scripts/verify-live-tunnel.sh` now runs on Linux as well as macOS, and its residue
-   check knows about `ip rule` and table 218 rather than assuming the macOS model. Still open: a
-   live-tunnel run passed on Ubuntu 24.04 / openvpn 2.6.19 / iproute2 6.1.0 with all seven
-   assertions green, which also settles the `>UPDOWN` device capture on the 2.6 floor. Still open:
-   a Debian stable and Fedora run, and IPv6 — every run so far had a v4-only tunnel, so the v6
-   mirror of §5.2 remains transcribed rather than executed.
-3. Linux distro matrix for §5.2 — every routing, teardown, and RPF claim needs verification on at
-   least Debian stable and Fedora. No Linux machine was available during research.
+2. **Linux, mostly closed — one blocker left.** §5.2's routing half runs on both families and on
+   four iproute2 versions (§10 test 3), the `ip rule del lookup 218` selector form, the `mtu`
+   argument on `ip route add`, and the exact `ip rule show` substrings the verification matches on
+   were all confirmed directly, and `scripts/verify-live-tunnel.sh` passed end to end on Ubuntu
+   24.04 / openvpn 2.6.19 with all seven assertions green. **The blocker is the netlink watcher
+   (§5.2): it is specified and not implemented.** Nothing re-asserts the rule or the backstop
+   after install, so a third party deleting both leaks until the daemon restarts.
+
+   Still open below that: a *live dual-stack tunnel*. The v6 policy is now executed against a
+   synthetic tun, but no run has ever carried real v6 traffic, so §5.5's happy-eyeballs path and
+   the pushed-`ifconfig-ipv6` parse remain unexercised end to end. That needs a v6-carrying
+   profile.
+3. Linux distro matrix for §5.2 — Debian 12, Debian 13 and Fedora 41 now pass §10 test 3 on both
+   families, but as containers on the Ubuntu host's kernel. Kernel-level claims (RPF behaviour in
+   particular, which is argued from `__fib_validate_source()` rather than measured) still want a
+   real Fedora and Debian VM.
 4. Whether to ship full-tunnel mode in v1.0 after all. It is what most users expect, and the daemon
    already has the privilege to do it.
 5. MTU handling. The observed utun MTU is 1240; tunnels commonly run 1300–1420. TCP relaying lets
