@@ -16,6 +16,7 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 thisconnect-shared = { path = "../../shared" }
 tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-dialog = "2"
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

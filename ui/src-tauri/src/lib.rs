@@ -54,6 +54,7 @@ fn reason_to_json(reason: &DaemonUnreachableReason) -> serde_json::Value {
 #[allow(clippy::expect_used)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let sink = AppHandleSink(app.handle().clone());
             let client = ipc_client::spawn(sink, ipc_client::socket_path());
@@ -63,6 +64,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::profile_import,
+            commands::profile_pick_file,
             commands::profile_list,
             commands::profile_get,
             commands::profile_delete,

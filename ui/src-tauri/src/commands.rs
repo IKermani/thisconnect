@@ -2,7 +2,8 @@
 //! Tauri commands: one thin wrapper per `Request` variant (design doc §4).
 //! No business logic here — the daemon owns validation and state transitions.
 
-use tauri::State;
+use tauri::{AppHandle, State};
+use tauri_plugin_dialog::DialogExt;
 use thisconnect_shared::ipc::{
     ConnectionStatus, ProfileId, ProfileSummary, PromptId, PromptReply, ProxyInfo,
     ProxySessionStats, Request, Response, Secret,
@@ -10,6 +11,16 @@ use thisconnect_shared::ipc::{
 
 use crate::error::{unexpected_response, UiError};
 use crate::ipc_client::{IpcClientError, IpcClientHandle, Reachability};
+
+/// Contents of a `.ovpn` file the user picked via the native file dialog,
+/// pre-filled into the import form (still goes through `profile_import` /
+/// the daemon's allowlist validation like any pasted config — this command
+/// only reads bytes off disk, it never talks to the daemon).
+#[derive(serde::Serialize)]
+pub struct PickedProfileFile {
+    name: String,
+    config: String,
+}
 
 async fn call(client: &IpcClientHandle, request: Request) -> Result<Response, UiError> {
     match client.request(request).await {
@@ -60,6 +71,30 @@ pub async fn profile_import(
         Response::Profile { profile } => Ok(profile),
         other => Err(unexpected_response("profile_import", &other)),
     }
+}
+
+#[tauri::command]
+pub fn profile_pick_file(app: AppHandle) -> Result<Option<PickedProfileFile>, UiError> {
+    let Some(picked) = app
+        .dialog()
+        .file()
+        .add_filter("OpenVPN profile", &["ovpn", "conf"])
+        .blocking_pick_file()
+    else {
+        return Ok(None);
+    };
+    let path = picked.into_path().map_err(|err| UiError::Internal {
+        message: format!("invalid file path: {err}"),
+    })?;
+    let config = std::fs::read_to_string(&path).map_err(|err| UiError::Internal {
+        message: format!("failed to read {}: {err}", path.display()),
+    })?;
+    let name = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("profile")
+        .to_owned();
+    Ok(Some(PickedProfileFile { name, config }))
 }
 
 #[tauri::command]

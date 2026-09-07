@@ -6,6 +6,7 @@ import type {
   DaemonEvent,
   DaemonUnreachableReason,
   CredentialPrompt,
+  PickedProfileFile,
   ProfileId,
   ProfileSummary,
   PromptId,
@@ -17,6 +18,10 @@ import type {
 
 export function profileImport(name: string, config: string): Promise<ProfileSummary> {
   return invoke('profile_import', { name, config });
+}
+
+export function profilePickFile(): Promise<PickedProfileFile | null> {
+  return invoke('profile_pick_file');
 }
 
 export function profileList(): Promise<ProfileSummary[]> {

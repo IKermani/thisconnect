@@ -17,6 +17,11 @@ export interface StaticChallengeSummary {
   echo: boolean;
 }
 
+export interface PickedProfileFile {
+  name: string;
+  config: string;
+}
+
 export interface ProfileSummary {
   id: ProfileId;
   name: string;
