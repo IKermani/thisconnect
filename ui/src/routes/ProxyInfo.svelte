@@ -19,34 +19,51 @@
   }
 </script>
 
-{#if $proxyInfo}
-  {#if !$proxyInfo.is_loopback_only}
-    <div class="banner">
-      Proxy is listening on a non-loopback address ({$proxyInfo.listen_addrs.join(', ')}).
-      {$proxyStats?.distinct_remote_peers ?? 0} distinct remote peer(s) seen this session.
-    </div>
+<div class="mx-auto flex max-w-2xl flex-col gap-5">
+  {#if $proxyInfo}
+    {#if !$proxyInfo.is_loopback_only}
+      <div
+        class="rounded-xl border border-(--color-warning) bg-(--color-warning-muted) px-4 py-3 text-sm text-(--color-warning)"
+      >
+        Proxy is listening on a non-loopback address ({$proxyInfo.listen_addrs.join(', ')}).
+        {$proxyStats?.distinct_remote_peers ?? 0} distinct remote peer(s) seen this session.
+      </div>
+    {/if}
+
+    <section class="rounded-xl border border-(--color-border) bg-(--color-surface) p-5">
+      <h2 class="mb-4 text-sm font-semibold">Proxy</h2>
+      <dl class="grid grid-cols-[auto_1fr] gap-x-6 gap-y-2 text-sm">
+        <dt class="text-(--color-fg-muted)">Listening on</dt>
+        <dd class="font-mono">{$proxyInfo.listen_addrs.join(', ')}</dd>
+        <dt class="text-(--color-fg-muted)">Auth</dt>
+        <dd>
+          {$proxyInfo.auth.type === 'disabled' ? 'disabled' : `enabled (${$proxyInfo.auth.username})`}
+        </dd>
+      </dl>
+
+      <div class="mt-4 flex items-center gap-2">
+        <input
+          type="text"
+          readonly
+          value={$proxyInfo.socks5h_url}
+          onclick={(e) => (e.target as HTMLInputElement).select()}
+          class="flex-1 rounded-md border border-(--color-border) bg-(--color-surface-2) px-2.5 py-1.5 font-mono text-xs text-(--color-fg) outline-none focus:border-(--color-accent)"
+        />
+        <button
+          onclick={copyUrl}
+          class="shrink-0 rounded-md border border-(--color-border) px-3 py-1.5 text-xs font-medium hover:bg-(--color-surface-2)"
+        >
+          Copy
+        </button>
+      </div>
+      {#if copied}
+        <p class="mt-2 text-xs text-(--color-accent)">Copied</p>
+      {/if}
+      {#if copyError}
+        <p class="mt-2 text-xs text-(--color-danger)">Copy failed — select the URL and copy manually.</p>
+      {/if}
+    </section>
+  {:else}
+    <p class="text-sm text-(--color-fg-muted)">Proxy is not active — connect a profile first.</p>
   {/if}
-
-  <section>
-    <h2>Proxy</h2>
-    <p>Listening on: {$proxyInfo.listen_addrs.join(', ')}</p>
-    <p>Auth: {$proxyInfo.auth.type === 'disabled' ? 'disabled' : `enabled (${$proxyInfo.auth.username})`}</p>
-    <button onclick={copyUrl}>Copy socks5h:// URL</button>
-    {#if copied}<span>Copied</span>{/if}
-    {#if copyError}<span class="error">Copy failed — select the URL below and copy manually.</span>{/if}
-    <input
-      type="text"
-      readonly
-      value={$proxyInfo.socks5h_url}
-      onclick={(e) => (e.target as HTMLInputElement).select()}
-    />
-  </section>
-{:else}
-  <p>Proxy is not active — connect a profile first.</p>
-{/if}
-
-<style>
-  .error {
-    color: darkred;
-  }
-</style>
+</div>

@@ -1,0 +1,43 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+@import 'tailwindcss';
+
+:root {
+  color-scheme: light dark;
+
+  --color-bg: #f6f7f8;
+  --color-surface: #ffffff;
+  --color-surface-2: #eef0f2;
+  --color-border: #dfe2e6;
+  --color-fg: #16181c;
+  --color-fg-muted: #676c76;
+  --color-accent: #0f9d63;
+  --color-accent-fg: #ffffff;
+  --color-accent-muted: #0f9d6320;
+  --color-danger: #d33a2c;
+  --color-danger-muted: #d33a2c1a;
+  --color-warning: #b3660a;
+  --color-warning-muted: #b3660a1a;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --color-bg: #0c0e12;
+    --color-surface: #14171d;
+    --color-surface-2: #1b1f27;
+    --color-border: #262b34;
+    --color-fg: #e7e9ed;
+    --color-fg-muted: #8b909b;
+    --color-accent: #2dd082;
+    --color-accent-fg: #06140d;
+    --color-accent-muted: #2dd08226;
+    --color-danger: #f0685a;
+    --color-danger-muted: #f0685a26;
+    --color-warning: #eab04a;
+    --color-warning-muted: #eab04a26;
+  }
+}
+
+body {
+  background: var(--color-bg);
+  color: var(--color-fg);
+}

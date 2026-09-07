@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { mount } from 'svelte';
+import './app.css';
 import App from './App.svelte';
 
 const target = document.getElementById('app');

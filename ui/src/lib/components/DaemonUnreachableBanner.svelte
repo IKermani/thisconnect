@@ -4,7 +4,9 @@
 </script>
 
 {#if !$reachability.reachable}
-  <div class="banner">
+  <div
+    class="border-b border-(--color-danger) bg-(--color-danger) px-4 py-2 text-sm font-medium text-white"
+  >
     {#if $reachability.reason.reason === 'permission_denied'}
       Daemon unreachable: your account was just added to the required group. Log out and back
       in, then reopen thisconnect.
@@ -16,11 +18,3 @@
     {/if}
   </div>
 {/if}
-
-<style>
-  .banner {
-    background: #b30000;
-    color: white;
-    padding: 0.5rem 1rem;
-  }
-</style>
